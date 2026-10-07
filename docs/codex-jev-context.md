@@ -80,3 +80,14 @@ stage 在目的檔案的同一目錄以 CREATE_NEW 建立，持續持有 exclusi
 CLI 設定讀回、CLI MCP 實際呼叫及目前 App session 載入是三項不同證據；共用 config.toml 不代表既有 App 已重連。
 
 官方依据：[State](https://docs.typesafe.ai/concepts/state)、[Choice](https://docs.typesafe.ai/primitives/choice)、[API](https://docs.typesafe.ai/api)。
+
+## 無效回覆的固定分類碼
+
+`jev_decide` 與 `jev_select_resources` 仍以 `reason=INVALID_RESOURCE_RESPONSE` 回退。
+若資源回覆驗證失敗，另回 `validation_code`：`RESPONSE_SHAPE`、`MODEL_ID`、
+`QUESTION_SET`、`ANSWER_SHAPE`、`ANSWER_TYPE`、`CHOICE_OPTION`、`PROBABILITY_KEYS`、
+`CONFIDENCE_VALUE`、`PROBABILITY_VALUE`、`PROBABILITY_SUM` 或 `CHOICE_ARGMAX`。
+分類指出第一個失敗檢查，不證明 provider 本身是根因；有多項違規時不列出全部。
+不回傳原始資料、來源文字、question ID、credential 或自由文字錯誤。
+既有 `reason`、必要資源保留、回退、門檻及 journal schema 都不變；journal 不新增此欄位。
+舊 caller 可繼續只讀 `reason`；沒有此欄位的舊失敗不能被事後還原。
