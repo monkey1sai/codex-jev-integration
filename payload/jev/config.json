@@ -1,0 +1,10 @@
+{
+  "enabled": true,
+  "confidence_threshold": 0.8,
+  "timeout_seconds": 20,
+  "observability": {
+    "enabled": true,
+    "max_records": 1000,
+    "max_bytes": 2097152
+  }
+}
