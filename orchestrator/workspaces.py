@@ -12,9 +12,14 @@ from .contracts import fingerprint, relative_file, ContractError
 
 def git(repo, *args):
     repo = Path(repo).resolve(strict=True)
-    root = repo.parent if repo.name == "fixture-repo" else repo.parents[1] if repo.parent.name == "worktrees" else None
+    root = repo.parent if repo.name in {"fixture-repo", "source-repo"} else repo.parents[1] if repo.parent.name == "worktrees" else None
     if root is None:
         raise ContractError("GIT_OUTSIDE_SYNTHETIC_FIXTURE")
+    if repo.name == 'source-repo':
+        from .policy import load
+        record, _ = load(root / 'controller/repo-adapter.json', max_bytes=2 * 1024 * 1024)
+        if record.get('repo') != str(repo) or record.get('mode') != 'DEVELOPMENT_REPO':
+            raise ContractError('REPO_ADAPTER_GIT_BINDING')
     hooks, template = root / "controller-git-hooks", root / "controller-git-template"
     for directory in (hooks, template):
         if (not directory.is_dir() or directory.is_symlink() or directory.is_junction()
@@ -68,7 +73,7 @@ def allocate(root, repo, claim):
     return path, temp
 
 
-def scan(path, *, ignore_scratch=False):
+def scan(path, *, ignore_scratch=False, max_bytes=2 * 1024 * 1024, max_files=256):
     path = Path(path).resolve(strict=True)
     result = {}
     total = 0
@@ -86,13 +91,14 @@ def scan(path, *, ignore_scratch=False):
         size = child.stat().st_size
         count += 1
         total += size
-        if total > 2 * 1024 * 1024 or count > 256:
+        if total > max_bytes or count > max_files:
             raise ContractError("ARTIFACT_SIZE_LIMIT")
         if ignore_scratch and rel.startswith('.tmp/'):
             # Fixed native scratch only. Reparse/special/size checks still run;
             # this is not an arbitrary caller-supplied exclusion list.
             continue
-        result[rel] = hashlib.sha256(child.read_bytes()).hexdigest()
+        with child.open('rb') as stream:
+            result[rel] = hashlib.file_digest(stream, 'sha256').hexdigest()
     return result
 
 

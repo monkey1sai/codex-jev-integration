@@ -1123,3 +1123,19 @@ Development runner 支援該明確 Repo 的最小 scope 與 pinned validators。
 明確新 envelope，驗證 Task→真實修改→Repo Build/Test→Artifact→Review→PASSED。
 只有單 Worker 新政策驗收完整通過才提出雙 Worker 方案；不沿用歷史已用額度，Merge 仍須
 人工授權。本輪到本地 checkpoint 停止；沒有 background Worker 或 remote mutation。
+
+## 2026-10-09 Real-game Repo Adapter checkpoint
+
+基準 `c328366`，遊戲 source `monkey1sai/changshan-longdan @805db86`；詳見
+[real-game report](game-repo-development.md)。沿用 Development runner/Queue/Supervisor/
+native Sandbox，加入 explicit opt-in Repo Adapter、pinned game Build/Test/acceptance。
+
+300 offline regression PASS（211 Orchestrator、77 Jev、12 Inventory）；native zero-provider
+baseline 308 game tests、tsc/Vite build、scope/cleanup/readiness bindings PASS。
+本次唯一 Campaign `game-campaign-20261009-05` 仍 **BLOCKED_NO_RETRY**：CLI startup warning
+透過 error item 觸發 UNEXPECTED_TOOL 即時取消，worker 1/1、review 0/1、game diff 空。
+原 raw、fencing、fresh restart audit、source-v6 保留；沒有 accepted artifact 或 PASSED。
+
+安全修正只加 Development 單次 warning suppression，error/UNKNOWN仍停止；其 native
+Worker 效果 NOT_RUN。沒有重派、Global/權限變更、Jev Phase3、push/PR/merge。
+單 Worker 真實遊戲交付尚未完成；需新的明確有界模型額度才能進下一次 attempt。

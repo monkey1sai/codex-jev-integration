@@ -152,3 +152,13 @@ scope 是 `SYNTHETIC_EVENT_CONTROLLER_AND_CGROUP_ONLY`，不宣稱 native sandbo
 restart case 是執行期間重開 Controller 並注入 lease expiry；強制殺死 Controller 的
 hard crash recovery 未測。kernel `RuntimeMaxSec` 保留，但不冒稱 crash 時即時停止。
 新 failure policy 在真實模型上的驗收本輪 NOT_RUN，需要新的有界授權。
+
+### 2026-10-09 opt-in real-repo adapter
+
+`NativeDevelopmentRunner(..., repo_adapter=RepoAdapter(root))` 擴充 existing native path，
+沒有改 synthetic 預設。Adapter 的 source/base、dependency/Node/config pins、scan/mode
+policy 及 persistent readiness binding 都在 controller custody，task input 不提供 commands。
+實際遊戲 baseline native 308 tests/build PASS；單一 real dispatch 被 startup error item
+即時取消，沒有修改或 Review/PASSED。結果及狀態見 [report](game-repo-development.md)。
+Development per-invocation warning suppression 的 source/offline check PASS，runtime NOT_RUN。
+歷史 FAIL/UNKNOWN 保留，未知 error 不放行，原生安全機制不關閉，無新派工或額度回補。

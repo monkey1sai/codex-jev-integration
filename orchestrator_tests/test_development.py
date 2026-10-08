@@ -251,11 +251,18 @@ class DevelopmentContracts(Fixture):
         runner.original_filesystem = {':minimal': 'read', ':workspace_roots': {}}
         settings, filesystem = runner._settings(self.repo, ['artifact/add.py'], {'model': 'gpt-6.1-sol', 'reasoning_effort': 'medium'})
         self.assertEqual(filesystem[':workspace_roots']['artifact'], 'write')
+        self.assertIs(settings['suppress_unstable_features_warning'], True)
         self.assertNotIn('artifact/add.py', filesystem[':workspace_roots'])
         _, readonly = runner._settings(self.repo, [], {'model': 'gpt-6-astra', 'reasoning_effort': 'high'})
         self.assertEqual(readonly[':workspace_roots']['artifact'], 'read')
         with self.assertRaisesRegex(ContractError, 'OUTSIDE_PROFILE'):
             runner._settings(self.repo, ['src/add.py'], {'model': 'gpt-6.1-sol', 'reasoning_effort': 'medium'})
+
+    def test_banner_setting_does_not_allow_unknown_error_events(self):
+        from orchestrator.worker_failures import classify
+        event = {'type': 'item.completed', 'item': {'id': 'item_0', 'type': 'error',
+            'message': 'Under-development features enabled: skip_host_skill_discovery.'}}
+        self.assertEqual(classify(event), ('UNEXPECTED_TOOL', 'STOP'))
 
     def test_development_uses_native_validator_not_host_fallback(self):
         from pathlib import Path
