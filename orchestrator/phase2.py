@@ -15,9 +15,13 @@ ACTIVE = {'CLAIMED', 'RUNNING', 'VALIDATING', 'HELD'}
 
 class Phase2Queue(CoreQueue):
     def __init__(self, *args, evidence_mode='production', review_registry=None, registry_sha256=None, **kwargs):
-        if evidence_mode not in {'production', 'OFFLINE_TEST'}:
+        if evidence_mode not in {'production', 'OFFLINE_TEST', 'DEVELOPMENT'}:
             raise ContractError('EVIDENCE_MODE')
         self.evidence_mode = evidence_mode
+        mode = 'development' if evidence_mode == 'DEVELOPMENT' else 'high_assurance'
+        if 'execution_mode' in kwargs and kwargs['execution_mode'] != mode:
+            raise ContractError('EXECUTION_MODE_MISMATCH')
+        kwargs['execution_mode'] = mode
         super().__init__(*args, **kwargs)
         with self.transaction() as db:
             db.execute('CREATE TABLE IF NOT EXISTS phase2_binding(id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER)')
@@ -35,6 +39,7 @@ class Phase2Queue(CoreQueue):
             db.execute('CREATE TABLE IF NOT EXISTS review_challenges(nonce TEXT PRIMARY KEY, task TEXT, target TEXT, used INTEGER DEFAULT 0)')
             db.execute('CREATE TABLE IF NOT EXISTS reviews(task TEXT PRIMARY KEY, envelope TEXT, hash TEXT, source TEXT)')
             db.execute('CREATE TABLE IF NOT EXISTS review_runtime(nonce TEXT PRIMARY KEY, hash TEXT UNIQUE, receipt TEXT)')
+            db.execute('CREATE TABLE IF NOT EXISTS development_native_slots(actor TEXT PRIMARY KEY, task TEXT, nonce TEXT)')
         from .evidence import ReviewTrust, ArtifactStore
         self.trust = ReviewTrust(review_registry, registry_sha256, self.path.parent / 'review-verification', self.repo) if review_registry else None
         if bool(review_registry) != bool(registry_sha256):
@@ -88,6 +93,7 @@ class Phase2Queue(CoreQueue):
             self._ready(db)
             cap = db.execute('SELECT active_cap FROM controller_binding').fetchone()[0]
             active = db.execute("SELECT count(*) FROM tasks WHERE state IN ('CLAIMED','RUNNING','VALIDATING','HELD')").fetchone()[0]
+            active += db.execute('SELECT count(*) FROM development_native_slots').fetchone()[0]
             budget = db.execute('SELECT * FROM budget').fetchone()
             if active >= cap or budget['used'] >= budget['max_dispatches']:
                 return None
@@ -270,6 +276,8 @@ class Phase2Queue(CoreQueue):
 
     def _import_review(self, envelope):
         self._fresh()
+        if self.evidence_mode == 'DEVELOPMENT':
+            raise ContractError('DEVELOPMENT_REVIEW_REQUIRES_CONTROLLER_EXECUTION')
         if self.trust is None:
             raise ContractError('TRUST_REGISTRY_REQUIRED')
         kind, key_hash = self.trust.verify(envelope)

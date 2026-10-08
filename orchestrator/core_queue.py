@@ -8,7 +8,7 @@ from .policy import compile_policy
 
 
 class CoreQueue(Store):
-    def __init__(self, path, repo, *, session=None):
+    def __init__(self, path, repo, *, session=None, execution_mode='high_assurance'):
         path = Path(path).absolute()
         if path.resolve().is_relative_to(Path(repo).resolve()):
             raise ContractError("CONTROLLER_DATABASE_OUTSIDE_REPO_REQUIRED")
@@ -17,7 +17,8 @@ class CoreQueue(Store):
                 raise ContractError("REPARSE_PATH")
         self.repo = repo
         self.session = deepcopy(session)
-        self.policy = compile_policy(repo, session=session)
+        self.execution_mode = execution_mode
+        self.policy = compile_policy(repo, session=session, execution_mode=execution_mode)
         settings = self.policy["settings"]["scheduler"]
         super().__init__(path, settings["max_dispatches"],
                          validator=lambda tasks: validate_tasks(tasks, self.policy),
@@ -26,7 +27,7 @@ class CoreQueue(Store):
                                   "task_schema": 2, "core_version": self.policy["core_version"]})
 
     def _fresh(self):
-        if compile_policy(self.repo, session=self.session)["policy_hash"] != self.policy["policy_hash"]:
+        if compile_policy(self.repo, session=self.session, execution_mode=self.execution_mode)["policy_hash"] != self.policy["policy_hash"]:
             raise ContractError("QUEUE_POLICY_DRIFT")
 
     def enqueue(self, tasks):

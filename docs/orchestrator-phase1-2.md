@@ -729,6 +729,9 @@ local tool 留在外部。該路線 NOT_STARTED，需要另外驗證 filesystem�
 broker、network、cancellation/custody；不能憑 VM 名稱宣稱安全。
 目前沒有可授予下一個 Real Worker Smoke 的完整 admission evidence。
 
+上述裁決屬於原 High-Assurance 路線。2026-10-08 使用者另行明確授權
+Development 原生信任模式；新模式不改寫本節 FAIL 或將 Production Gate 標為 PASS。
+
 ### 重啟核對與回歸
 
 本輪 fresh controller 實跑：
@@ -745,3 +748,109 @@ RPC allowlist、protocol error 不算存取拒絕，以及 lifecycle failure 不
 原 220 項保留；回歸結果記錄於 `runs/regression-*-external-executor-20261008.log`。
 本輪全部實跑 **234 PASS**：Orchestrator 145（41.916s）、Jev 77（3.881s）、
 Inventory 12（0.020s）。離線 guard tests 不作為實際 Executor containment PASS。
+
+## Development Execution Mode checkpoint — 2026-10-08
+
+基準 `8c2499979e1b5ba8bf53d415a564801e51f28270`。使用者改變日常開發的
+驗收要求，明確接受官方 Codex 原生 Sandbox、Approval 與模型安全機制。
+本輪實作新的 `DEVELOPMENT` mode；不重開舊 Production queue，也不將歷史
+High-Assurance FAIL 改成 PASS。完整責任、配置與操作入口見
+[Development Execution Mode](development-execution-mode.md)。
+
+### 已實作與重用
+
+- 延伸現有 Policy Compiler、SQLite Queue、Supervisor、Lease/Fencing、
+  Worktree、Dependency Snapshot、ArtifactStore 與 Merge Queue。
+- 新 mode 綁 policy hash、source hash、queue ID 與 evidence realm；Workspace
+  無法改選 mode、降低 review 或突破 active≤2。Rule Router 不依賴 Jev。
+- `NativeDevelopmentRunner` 啟動 pinned 官方 Linux CLI 0.161.0，保存真正的
+  CLI events、工具結果、diff、artifact hash 與 execution receipt。exit 0
+  不足以驗收。Native Sandbox 啟動失敗沒有 unprotected Host fallback。
+- 固定 Validator Registry 經官方 app-server `command/exec` 執行 literal argv，
+  artifact readonly；AST guard 與四組算術斷言避免 fixture 自行假造完成標記。
+- Reviewer 必須由 Controller 真正另開 Astra/high CLI turn；綁 task、attempt、
+  artifact、獨立 native thread、nonce 與 Supervisor owner。Caller 的 review JSON
+  不可入庫。執行 assurance 為 `CONTROLLER_EXECUTION_NATIVE_TRUST`，不偽造
+  provider model attestation。此新 reviewer 路徑尚未經真實推論驗收。
+- Review dispatch intent、capacity slot 與 nonce 持久化；重啟不能自動重發。
+  Worker、Validator 或 Reviewer 的任何 cleanup 未確認，都保留 HELD/容量與鎖。
+  不能以 Worker 已退出代替 Validator 已清理的證據。
+
+額外 External Executor、同次 namespace attestation、Production provenance
+程式保留在原有獨立入口；Development 預設不載入，沒有繼續擴建隔離框架。
+本候選僅支援已準備的 WSL Linux fixture runtime，不是 Global 安裝或一般
+Windows/任意 Repo Worker adapter 的完成宣告。
+
+### 真實執行與停止條件
+
+| Run / attempt | 實際結果 | 未完成的條件 |
+|---|---|---|
+| `development-live-20261008-01` / `5eb5bbf466a24d78b4f3c6402690bb73` | native instructions loader 不支援檔案型 writable root；模型 turn 未開始；CANCELLED / NO_RETRY | M1 FAIL，沒有重發此 dispatch |
+| `development-live-20261008-02` / `72ca0dcf6fc2435a9ca7612a993ea6f4` | Sol/medium 真實 turn 完成；shell 與 file_change completed；`artifact/add.py` 已寫出正確加法 | Controller `OUT_OF_SCOPE_DIFF` 拒收；CANCELLED / NO_RETRY；Task Validator、Reviewer、雙 Worker NOT_RUN |
+| `development-validator-readiness-20261008-02` | 官方 `thread/start` readiness 與 `command/exec` 成功；四組斷言輸出 `ACCEPTANCE_PASS:add`；inference turns=0；cgroup 空、readers 關閉 | 使用 Controller 自備 fixture，不是失敗 Worker artifact 的追認 |
+
+第二次真實 Worker 的 native thread 為
+`01a11b39-e82c-7262-ab2b-ff4c2769f570`；有 `turn.started`、`turn.completed`、
+成功 command 與 file_change。第一次 `rg` 工具 exit 127 也保留在 raw events，
+沒有把所有工具都報為成功。產物內容為 `def add(a, b): return a + b`，
+31 bytes，SHA-256：
+`b31ad9f0e26461c1e38ba4071046e8c3c6aa2cda4b46b6649872ba0ba61cd565`。
+
+拒收原因是 native runtime 在既有可寫 `.tmp/` 留下零 byte lock。Controller
+當時把 scratch 算成專案 diff。修正後只排除固定 `.tmp/` 的 project diff；
+scratch hashes 另入 receipt，大小、檔案數、symlink/reparse 與 special-file
+限制仍套用。没有增加 writable scope。此修正有離線驗證，尚未取得新 Worker
+端到端結果；原失敗 attempt 不會因此改成 PASS。
+
+Native release 對 writable root 需要目錄；本候選沿用原 profile 的 `artifact/`
+目錄 ceiling，精確 allowed_files 是 Controller diff/custody 驗收，不能宣稱
+OS 已阻止該目錄內所有暫時越界寫入。Reviewer/Validator 的 artifact 為只讀。
+
+### Evidence custody 與重啟核對
+
+公開 execution evidence 保存於 ignored
+`runs/development-execution-20261008/`；沒有搬動或讀出 credentials。
+其中 `custody.json` 記錄 56 個檔案，SHA-256：
+`f8f1ac2ca758b04a723af04869524016c9cd43cb06d68da94680ee3220168f66`。
+Fresh read-only hash audit 56/56 一致；兩個新失敗 result 仍為
+`BLOCKED_SINGLE_NO_RETRY`。既有 WSL smoke result、authorized attempt result、
+worker-events 與 External PoC custody 也符合既存 hashes。
+第一次歷史 events audit 用錯 filename `events.jsonl`，保留該 MISSING 查找紀錄；
+另外的 path-correction audit 以實際 `worker-events.jsonl` 驗證一致。
+這些 hash audit 不重開 queue、不建立 dispatch，也不等於 M1/M2 成功後的 recovery。
+
+### 回歸與獨立審查
+
+實際執行命令（repo root，Inventory 命令於 `payload/jev`）：
+
+```powershell
+$env:PYTHONDONTWRITEBYTECODE = '1'
+python -B -m unittest discover -s orchestrator_tests -v
+python -B -m unittest test_response_diagnostics test_decision test_phase2a test_resources test_combined test_inventory_safety
+python -B -m unittest test_inventory
+```
+
+本候選實跑 **257 PASS**：Orchestrator 168（37.993s）、Jev 77（3.058s）、
+Inventory 12（0.015s）。原 234 項保留，新增 23 項 Development tests。
+包括 mode/review floor、舊 queue realm、防 replay、review capacity/restart、
+native thread 身分、published artifact 比對、scratch guard、validator 假完成、
+沒有 Host fallback、Supervisor review heartbeat，以及 Worker 已清理但 Validator
+未知時仍保留鎖的實際 attempt fault injection。另以實際 review method 驗證
+審查期間 policy drift 不可發布 PASS；Reviewer 完成後再次核對 policy/binary pins。
+
+獨立 architecture/security review 為 source/evidence advisory，已接受已修正的
+候選；不能代替 Task 的 Astra/high review 或 production attestation。
+
+### 狀態與下一步
+
+- **DONE（實作與離線驗證）**：明確 Development mode、原生 dispatch/validation/
+  independent-review 接點、scratch 修正、cleanup/capacity fail-closed。
+- **PARTIAL（真實驗收）**：Worker 已真正呼叫工具並改碼；Controller 尚未接受
+  完整 Task→Validation→Review→PASSED。M1 未完成，M2 NOT_RUN。
+- **BLOCKED（保留路線）**：原 High-Assurance Production Admission；不作新的日常 gate。
+
+最新已授權 envelope 為最多 3 Worker + 3 Review turns、各 task 一次、零重試。
+其中一個 Worker dispatch 已消耗且失敗；Controller 的修正不重設已用次數。
+本輪已另詢問後續範圍，答覆前不發出新模型請求：可用剩餘額度只完成新單 Worker，
+或取得完整新 1→2 envelope。所有後續測試使用全新 task/attempt；舊失敗 immutable。
+沒有修改 Global production、ACL、安全策略或 children ceiling；沒有 push、PR、merge。

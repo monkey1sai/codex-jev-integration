@@ -128,7 +128,9 @@ def merge(base, overlay):
     return result
 
 
-def compile_policy(repo, *, defaults=None, session=None):
+def compile_policy(repo, *, defaults=None, session=None, execution_mode='high_assurance'):
+    if execution_mode not in {'high_assurance', 'development'}:
+        raise ContractError('EXECUTION_MODE')
     repo = Path(repo).absolute()
     safe_path(repo, ".codex/orchestrator.json")
     source = Path(defaults) if defaults else Path(__file__).with_name("defaults.json")
@@ -183,15 +185,20 @@ def compile_policy(repo, *, defaults=None, session=None):
         sources.append({"layer": "repo_jev", "path": str(jev_path), "sha256": digest})
         if jev.get('enabled') is False:
             provenance['routing.jev_enabled'] = len(sources) - 1
-    code_names = ("__init__.py", "contracts.py", "store.py", "policy.py", "tasks.py", "core_queue.py", "routing.py", "provision.py", "__main__.py", "phase2.py", "pipeline.py", "processes.py", "workspaces.py", "cli_adapter.py", "mock_v2_worker.py", "evidence.py", "snapshots.py", "validators.py", "supervisor.py", "merge_validation.py", "admission.py")
+    code_names = ("__init__.py", "contracts.py", "store.py", "policy.py", "tasks.py", "core_queue.py", "routing.py", "provision.py", "__main__.py", "phase2.py", "pipeline.py", "processes.py", "workspaces.py", "cli_adapter.py", "mock_v2_worker.py", "evidence.py", "snapshots.py", "validators.py", "supervisor.py", "merge_validation.py", "admission.py", "development.py")
     code_hashes = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest() for name in code_names}
+    for name in ('tools/development_validator.py', 'tools/development_smoke.py', 'tools/linux_worker_smoke.py'):
+        code_hashes[name] = hashlib.sha256((Path(__file__).resolve().parents[1] / name).read_bytes()).hexdigest()
+    floors = deepcopy(FLOORS)
+    floors['live_execution'] = execution_mode == 'development'
     return {"core_version": VERSION, "repo_identity": str(repo.resolve()).casefold(),
-            "settings": base, "floors": deepcopy(FLOORS), "sources": sources,
+            "execution_mode": execution_mode,
+            "settings": base, "floors": floors, "sources": sources,
             "field_sources": {key: sources[provenance[key]] for key in leaves(base)},
             "floor_source": {'layer': 'compiled', 'version': VERSION},
             "core_sha256": code_hashes,
-            "policy_hash": fingerprint({"version": VERSION, "settings": base, "floors": FLOORS, "sources": sources, "core": code_hashes}),
-            "native_effective_config": "UNVERIFIED", "live_admission": "HELD"}
+            "policy_hash": fingerprint({"version": VERSION, "mode": execution_mode, "settings": base, "floors": floors, "sources": sources, "core": code_hashes}),
+            "native_effective_config": "UNVERIFIED", "live_admission": "NATIVE_TRUST_REQUIRES_EXECUTION" if execution_mode == 'development' else "HELD"}
 
 
 def validate_jev(value):

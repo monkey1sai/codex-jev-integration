@@ -68,10 +68,11 @@ def allocate(root, repo, claim):
     return path, temp
 
 
-def scan(path):
+def scan(path, *, ignore_scratch=False):
     path = Path(path).resolve(strict=True)
     result = {}
     total = 0
+    count = 0
     for child in path.rglob("*"):
         rel = child.relative_to(path).as_posix()
         if child.is_symlink() or child.is_junction():
@@ -83,9 +84,14 @@ def scan(path):
         if not child.is_file():
             raise ContractError("NONREGULAR_ARTIFACT")
         size = child.stat().st_size
+        count += 1
         total += size
-        if total > 2 * 1024 * 1024 or len(result) >= 256:
+        if total > 2 * 1024 * 1024 or count > 256:
             raise ContractError("ARTIFACT_SIZE_LIMIT")
+        if ignore_scratch and rel.startswith('.tmp/'):
+            # Fixed native scratch only. Reparse/special/size checks still run;
+            # this is not an arbitrary caller-supplied exclusion list.
+            continue
         result[rel] = hashlib.sha256(child.read_bytes()).hexdigest()
     return result
 

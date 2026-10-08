@@ -25,9 +25,9 @@ def rule_route(policy, candidate_ids, *, capability, loads=None):
             'source': 'deterministic', 'provider_called': False, 'executed': False}
 
 
-def artifact_manifest(worktree, claim, baseline, *, general=False):
+def artifact_manifest(worktree, claim, baseline, *, general=False, ignore_scratch=False):
     task = claim['task']
-    after = scan(worktree)
+    after = scan(worktree, ignore_scratch=ignore_scratch)
     changed = sorted(k for k in set(baseline) | set(after) if baseline.get(k) != after.get(k))
     if git(worktree, 'rev-parse', 'HEAD') != task['base_sha']:
         raise ContractError('WORKER_CHANGED_HEAD')

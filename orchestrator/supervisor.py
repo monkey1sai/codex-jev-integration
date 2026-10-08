@@ -1,4 +1,4 @@
-"""Continuous bounded OFFLINE_TEST supervisor; native admission stays closed."""
+"""Bounded supervisor for offline tests or explicit native-trust Development."""
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import json
 import threading
@@ -9,13 +9,20 @@ from .pipeline import mock_attempt
 
 
 class Supervisor:
-    def __init__(self, queue, root, repo, *, max_active=1, validators=None):
-        if queue.evidence_mode != 'OFFLINE_TEST':
+    def __init__(self, queue, root, repo, *, max_active=1, validators=None,
+                 native_runner=None, capabilities=None):
+        if queue.evidence_mode not in {'OFFLINE_TEST', 'DEVELOPMENT'}:
             raise ContractError('NATIVE_SUPERVISOR_BLOCKED')
+        if queue.evidence_mode == 'DEVELOPMENT' and native_runner is None:
+            raise ContractError('NATIVE_RUNNER_REQUIRED')
+        if queue.evidence_mode != 'DEVELOPMENT' and native_runner is not None:
+            raise ContractError('RUNNER_REALM_MISMATCH')
         if type(max_active) is not int or not 1 <= max_active <= min(2, queue.policy['settings']['scheduler']['max_active']):
             raise ContractError('ACTIVE_CAP')
         self.queue, self.root, self.repo = queue, root, repo
         self.max_active, self.validators = max_active, validators
+        self.native_runner = native_runner
+        self.capabilities = capabilities or {'synthetic'}
         self.stop = threading.Event()
         self.owner = uuid.uuid4().hex
         with queue.transaction() as db:
@@ -43,19 +50,47 @@ class Supervisor:
         deadline = time.monotonic() + max_seconds
         pending, outcomes = {}, []
         pool = ThreadPoolExecutor(max_workers=self.max_active)
+        renew_done = threading.Event()
+        def maintain_owner():
+            while not renew_done.wait(2):
+                try:
+                    self._renew()
+                    if time.monotonic() >= deadline:
+                        self.stop.set()
+                except Exception:
+                    self.stop.set()
+                    return
+        renewer = threading.Thread(target=maintain_owner, daemon=True)
+        if self.native_runner:
+            self.native_runner.supervisor_owner = self.owner
+            renewer.start()
         try:
             try:
                 while not self.stop.is_set() and time.monotonic() < deadline:
                     self._renew()
                     while len(pending) < self.max_active:
-                        claim = self.queue.claim(lease_seconds=60, capabilities={'synthetic'})
+                        claim = self.queue.claim(lease_seconds=60, capabilities=self.capabilities)
                         if claim is None:
                             break
-                        future = pool.submit(mock_attempt, self.queue, self.root, self.repo,
-                                             claim=claim, stop=self.stop, validators=self.validators,
-                                             timeout=min(30, claim['task']['budgets']['runtime_seconds']), behavior=behavior)
+                        if self.native_runner:
+                            future = pool.submit(self.native_runner.attempt, claim, self.stop)
+                        else:
+                            future = pool.submit(mock_attempt, self.queue, self.root, self.repo,
+                                                 claim=claim, stop=self.stop, validators=self.validators,
+                                                 timeout=min(30, claim['task']['budgets']['runtime_seconds']), behavior=behavior)
                         pending[future] = claim
                     if not pending:
+                        if self.native_runner:
+                            # Review is serial and runs only after all workers stop:
+                            # reviewer processes count toward the same capacity.
+                            for row in self.queue.snapshot()['tasks']:
+                                if row['state'] == 'REVIEW':
+                                    outcomes.append(self.native_runner.review(row['id'], self.stop))
+                            rows = self.queue.snapshot()['tasks']
+                            if any(r['state'] in {'REVIEW', 'HELD', 'FAILED', 'CANCELLED'} for r in rows):
+                                break
+                            if any(r['state'] == 'READY' for r in rows):
+                                continue
                         # External reviews can make child tasks READY while polling.
                         rows = self.queue.snapshot()['tasks']
                         if all(r['state'] in {'PASSED', 'FAILED', 'CANCELLED'} for r in rows):
@@ -84,7 +119,11 @@ class Supervisor:
                             outcomes.append({'status': 'HELD', 'reason': 'supervisor_shutdown'})
         finally:
             self.stop.set()
+            renew_done.set()
+            if self.native_runner:
+                renewer.join(timeout=3)
             with self.queue.transaction() as db:
                 db.execute('DELETE FROM supervisor_lock WHERE owner=?', (self.owner,))
         return {'outcomes': outcomes, 'queue': self.queue.snapshot(), 'mode': self.queue.evidence_mode,
-                'native_dispatches': 0, 'merge_executed': False}
+                'native_dispatches': self.native_runner.dispatches if self.native_runner else 0,
+                'merge_executed': False}

@@ -173,7 +173,7 @@ def check_add_artifact(data):
         raise ValueError('PURE_ADD_EXPRESSION_REQUIRED')
 
 
-def run_cgroup(command, unit, seconds, repo, env, evidence, prefix):
+def run_cgroup(command, unit, seconds, repo, env, evidence, prefix, *, cancel=None, before_terminate=None):
     """Own descendants independently of launcher lifetime; cap each output stream."""
     control_env = {**env, 'XDG_RUNTIME_DIR': '/run/user/'+str(os.getuid())}
     argv = ['/usr/bin/systemd-run', '--user', '--unit='+unit, '--pipe', '--wait', '--collect',
@@ -182,7 +182,7 @@ def run_cgroup(command, unit, seconds, repo, env, evidence, prefix):
             '--property=MemoryMax=1073741824', '--property=MemorySwapMax=0',
             '--property=TasksMax=64',
             '/usr/bin/env', '-i', *[k+'='+v for k, v in env.items()], *command]
-    record = {'argv': argv, 'unit': unit, 'status': 'STARTING'}
+    record = {'argv': argv, 'unit': unit, 'status': 'STARTING', 'started_unix': time.time()}
     exceeded = threading.Event()
     handles = []
     process = None
@@ -208,13 +208,15 @@ def run_cgroup(command, unit, seconds, repo, env, evidence, prefix):
             handle.start(); handles.append(handle)
         deadline = time.monotonic()+seconds+5
         record['unit_details'] = ''
-        while process.poll() is None and not exceeded.is_set() and time.monotonic() < deadline:
+        while (process.poll() is None and not exceeded.is_set() and time.monotonic() < deadline
+               and not (cancel is not None and cancel.is_set())):
             if not record['unit_details']:
                 details = subprocess.run(['/usr/bin/systemctl', '--user', 'show', unit,
                                           '--property=MainPID,ControlGroup,KillMode,RuntimeMaxUSec,MemoryMax,MemorySwapMax,TasksMax'],
                                          env=control_env, capture_output=True, text=True, timeout=5)
                 if details.returncode == 0 and 'MainPID=0\n' not in details.stdout:
                     record['unit_details'] = details.stdout
+                    record['main_pid_observed_unix'] = time.time()
                     fields = dict(line.split('=', 1) for line in details.stdout.splitlines() if '=' in line)
                     expected = '/user.slice/user-'+str(os.getuid())+'.slice/user@'+str(os.getuid())+'.service/app.slice/'+unit
                     if fields.get('ControlGroup') == expected:
@@ -224,9 +226,13 @@ def run_cgroup(command, unit, seconds, repo, env, evidence, prefix):
             time.sleep(.05)
         record['output_limit_exceeded'] = exceeded.is_set()
         if process.poll() is None:
-            record['status'] = 'OUTPUT_LIMIT' if exceeded.is_set() else 'TIMEOUT_OR_UNKNOWN'
+            record['status'] = ('CANCELLED' if cancel is not None and cancel.is_set() else
+                                'OUTPUT_LIMIT' if exceeded.is_set() else 'TIMEOUT_OR_UNKNOWN')
+            if before_terminate is not None:
+                before_terminate()
         else:
             record['exit_code'] = process.returncode
+            record['launcher_exited_unix'] = time.time()
             record['status'] = 'EXITED'
     except Exception as exc:
         record['error'] = type(exc).__name__+':'+str(exc)
@@ -266,6 +272,7 @@ def run_cgroup(command, unit, seconds, repo, env, evidence, prefix):
         record['remaining_cgroup_pids'] = remaining
         if remaining or not record['output_readers_closed']:
             record['status'] = 'CLEANUP_UNVERIFIED'
+        record['ended_unix'] = time.time()
         write_new(evidence/(prefix+'-execution.json'), record)
     return record
 
