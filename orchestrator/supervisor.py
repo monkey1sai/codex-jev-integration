@@ -1,0 +1,90 @@
+"""Continuous bounded OFFLINE_TEST supervisor; native admission stays closed."""
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+import json
+import threading
+import time
+import uuid
+from .contracts import ContractError
+from .pipeline import mock_attempt
+
+
+class Supervisor:
+    def __init__(self, queue, root, repo, *, max_active=1, validators=None):
+        if queue.evidence_mode != 'OFFLINE_TEST':
+            raise ContractError('NATIVE_SUPERVISOR_BLOCKED')
+        if type(max_active) is not int or not 1 <= max_active <= min(2, queue.policy['settings']['scheduler']['max_active']):
+            raise ContractError('ACTIVE_CAP')
+        self.queue, self.root, self.repo = queue, root, repo
+        self.max_active, self.validators = max_active, validators
+        self.stop = threading.Event()
+        self.owner = uuid.uuid4().hex
+        with queue.transaction() as db:
+            db.execute('CREATE TABLE IF NOT EXISTS supervisor_lock(id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT, expires REAL)')
+            row = db.execute('SELECT * FROM supervisor_lock').fetchone()
+            if row and row['expires'] > time.time():
+                raise ContractError('SUPERVISOR_ALREADY_ACTIVE')
+            db.execute('INSERT OR REPLACE INTO supervisor_lock VALUES(1,?,?)', (self.owner, time.time() + 60))
+        # Restarts fence expired attempts, but never manufacture cleanup proof.
+        queue.expired()
+
+    def cancel(self):
+        self.stop.set()
+
+    def _renew(self):
+        with self.queue.transaction() as db:
+            row = db.execute('SELECT * FROM supervisor_lock').fetchone()
+            if not row or row['owner'] != self.owner or row['expires'] <= time.time():
+                raise ContractError('STALE_SUPERVISOR')
+            db.execute('UPDATE supervisor_lock SET expires=? WHERE owner=?', (time.time() + 60, self.owner))
+
+    def run(self, *, max_seconds=30, behavior='valid'):
+        if type(max_seconds) not in (int, float) or not 0 < max_seconds <= 600:
+            raise ContractError('SUPERVISOR_RUNTIME')
+        deadline = time.monotonic() + max_seconds
+        pending, outcomes = {}, []
+        pool = ThreadPoolExecutor(max_workers=self.max_active)
+        try:
+            try:
+                while not self.stop.is_set() and time.monotonic() < deadline:
+                    self._renew()
+                    while len(pending) < self.max_active:
+                        claim = self.queue.claim(lease_seconds=60, capabilities={'synthetic'})
+                        if claim is None:
+                            break
+                        future = pool.submit(mock_attempt, self.queue, self.root, self.repo,
+                                             claim=claim, stop=self.stop, validators=self.validators,
+                                             timeout=min(30, claim['task']['budgets']['runtime_seconds']), behavior=behavior)
+                        pending[future] = claim
+                    if not pending:
+                        # External reviews can make child tasks READY while polling.
+                        rows = self.queue.snapshot()['tasks']
+                        if all(r['state'] in {'PASSED', 'FAILED', 'CANCELLED'} for r in rows):
+                            break
+                        self.stop.wait(.05)
+                        continue
+                    completed, _ = wait(pending, timeout=.05, return_when=FIRST_COMPLETED)
+                    for future in completed:
+                        claim = pending.pop(future)
+                        try:
+                            outcomes.append(future.result())
+                        except Exception as error:
+                            self.queue.fence(claim, 'supervisor_exception')
+                            outcomes.append({'status': 'HELD', 'reason': type(error).__name__})
+            finally:
+                # Cancel before executor shutdown waits, including lost-owner/claim exceptions.
+                self.stop.set()
+                for future, claim in pending.items():
+                    self.queue.fence(claim, 'supervisor_shutdown')
+                pool.shutdown(wait=True, cancel_futures=True)
+                for future in pending:
+                    if not future.cancelled():
+                        try:
+                            outcomes.append(future.result())
+                        except Exception:
+                            outcomes.append({'status': 'HELD', 'reason': 'supervisor_shutdown'})
+        finally:
+            self.stop.set()
+            with self.queue.transaction() as db:
+                db.execute('DELETE FROM supervisor_lock WHERE owner=?', (self.owner,))
+        return {'outcomes': outcomes, 'queue': self.queue.snapshot(), 'mode': self.queue.evidence_mode,
+                'native_dispatches': 0, 'merge_executed': False}

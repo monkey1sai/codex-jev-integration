@@ -1,6 +1,6 @@
 # ADR / Delivery: Phase 1–2 incremental orchestrator
 
-Overall **PARTIAL**; native execution **BLOCKED**. Configuration/control-plane and a bounded mock attempt are implemented and tested. This is not a completed production scheduler.
+Overall **PARTIAL**; native execution and observed native review **BLOCKED**. This continuation implements the requested five capabilities in an explicitly separated OFFLINE_TEST realm. It is not a completed production scheduler. Native diagnosis is in [native-sandbox-diagnostics.md](native-sandbox-diagnostics.md).
 
 ## Architecture and reuse
 
@@ -40,22 +40,33 @@ PENDING → READY → CLAIMED → RUNNING → VALIDATING → REVIEW
                                   ↘ HELD       ↘ FAILED
 HELD → CANCELLED after verified process-tree cleanup
 HELD → PENDING only for known-safe retry within budget
-REVIEW → PASSED requires trusted independent review (NOT IMPLEMENTED)
+REVIEW → PASSED requires verified fixture review in OFFLINE_TEST
+Production REVIEW → PASSED remains BLOCKED pending observed native provenance
 ```
 
-Dependencies require PASSED. No caller boolean, worker or Jev can produce it. The full dependent DAG therefore cannot finish in this candidate; this is a missing feature, not a successful review.
+Dependencies require PASSED plus bound review, receipt and immutable artifact evidence. A three-task dependent DAG can finish with signed synthetic fixtures. No caller boolean, worker or Jev can produce PASSED. Fixture review is never actual Astra review.
 
 ## Execution and recovery evidence
 
 `Phase2Queue` extends CoreQueue/Store. `pipeline.mock_attempt()` composes detached worktrees and bounded subprocesses. Windows processes join a kill-on-close Job while suspended, then resume. Runtime is the smaller of caller timeout and task budget; heartbeat uses effective runtime plus 30-second validation grace, capped at 600 seconds.
 
-The v2 executable validator is fixed controller-owned `constant-json-v1`, which parses typed JSON answer 42. It never imports worker code or runs repo-provided validator argv. General project validators remain unimplemented.
+The fixed controller-owned `constant-json-v1` remains available. `ValidatorRegistry` additionally executes literal argv approved in an external controller-pinned registry, bound to compiled repo validator definitions and policy hash. Executables and fixed scripts are pinned outside worker scope; task data cannot inject commands. Clean environment, Job/process timeout, exit code, output hashes and frozen receipts are checked. Actual execution is restricted to OFFLINE_TEST synthetic validators. Arbitrary project-generated test code remains BLOCKED without native containment.
 
-Artifact manifests verify HEAD, tracked/untracked bytes, exact scope, immutable inputs and expected outputs. Bytes are frozen into controller evidence with exclusive creation and rehashed before fenced publication. Missing input snapshots are rejected; parent-artifact integration is not implemented.
+Artifact manifests verify HEAD, tracked/untracked bytes, exact scope, immutable inputs and expected outputs. Current claim and attempt format are checked before artifact I/O. Published bytes must equal validated hashes, and receipts must bind the resulting manifest. Parent artifacts enter only explicitly declared child inputs with matching hashes, PASSED state and immutable review/manifest binding. Missing, stale, conflicting or tampered artifacts are rejected. Controller-owned storage is hash-detectable and exclusive-create; physical custody is unverified until native sandbox canaries pass.
 
-Recovery fences expired attempts and retains locks until verified cleanup. Missing PID, controller exception or crash is not cleanup proof. Unknown provider completion cannot auto-retry. Local merge rows bind receipt hash and remain HELD. `merge()` rejects even a caller-supplied authorized=True. No local integration-branch application or conflict dry-run exists yet.
+Recovery fences expired attempts and retains locks until verified cleanup. Missing PID, controller exception or crash is not cleanup proof. Unknown provider completion cannot auto-retry. Continuous `Supervisor` replenishes eligible DAG tasks with at most two synthetic attempts, durable owner lease, queue admission/backpressure and bounded runtime. Cancellation or ownership loss stops and fences work before waiting for executor shutdown. Recovery conservatively holds unknown cleanup; it does not silently rerun it.
 
-## Test results, 2026-10-08
+Local merge rows remain HELD. Conflict validation clones an independent bare object store, disables inherited Git configuration/hooks/drivers/lazy fetch/replacements and limits all Git subprocess output/time. Candidate regular-file blobs and exact changed paths must match reviewed artifacts. `merge-tree --write-tree` writes objects only in the isolated clone, without changing source HEAD/index/worktree. CLEAN is conflict evidence, never merge permission. `merge()` rejects even caller-supplied authorized=True.
+
+## Trusted review contract
+
+Controller bootstrap pins a registry outside the reviewed repo, installed OpenSSL executable and public keys. Detached SHA-256/RSA signatures authenticate the registered key; the importer never loads private keys. Challenges bind queue UUID, immutable production/OFFLINE_TEST realm, registry/policy hash, task/attempt/epoch, receipt/manifest hash, purpose, expiry and one-shot nonce. Import consumes the nonce and changes state atomically; duplicate, unknown, modified, cross-queue, stale or low-model/effort evidence is rejected. Repo-strengthened Astra effort is retained.
+
+Identity authenticity, actor independence and observed model provenance are separate claims. `offline_fixture` keys can release only OFFLINE_TEST. Production requires a native attester and still unconditionally rejects `REQUIRED_NATIVE_REVIEW_PROVENANCE_UNAVAILABLE`: a valid signature plus a claimed model name cannot establish a real independent Astra run. Trust enrollment, native execution ledger and controller-root custody are still blockers. No production key or auto-approval broker was installed.
+
+Added durable tables: evidence_binding, artifact_manifests, review_challenges, reviews, validator_binding and supervisor_lock. Controller-owned frozen snapshots, validator output/receipts and merge evidence complement the existing SQLite events. Policy/source hashes intentionally require explicit migration after source changes.
+
+## Previous checkpoint test results, 2026-10-08
 
 | Check | Result | Practical limit |
 |---|---|---|
@@ -90,7 +101,35 @@ python -B -m orchestrator phase2-status --repo '<repo>' --database '<same SQLite
 python -B -m orchestrator phase2-expire --repo '<repo>' --database '<same SQLite path>'
 ```
 
-Use fresh smoke run roots. Queue reopen needs the same source/config/session binding; drift requires deliberate migration. `phase2-expire` fences only and never clears locks. `phase2-status` may initialize a missing DB through its constructor; it is not a completely read-only command. Queue CLI does not dispatch/validate workers.
+Use fresh smoke run roots. Queue reopen needs the same source/config/session binding; drift requires deliberate migration. `phase2-expire` fences only and never clears locks. `phase2-status` may initialize a missing DB through its constructor; it is not a completely read-only command. Production/native dispatch is unavailable. Explicit OFFLINE_TEST `phase2-supervise-mock` runs synthetic workers and pinned synthetic validators; it does not automatically sign or approve reviews.
+
+New operator commands are `phase2-review-challenge`, `phase2-import-review`, `phase2-supervise-mock` and `phase2-merge-check`. All accept explicit `--evidence-mode`, `--review-registry` and `--registry-sha256`; these must match the queue's immutable initial binding. Production is the default. Existing production queues cannot silently become OFFLINE_TEST. External trust registry enrollment is a controller/bootstrap responsibility, not a task or worker action. `--help` lists exact arguments.
+
+For an already provisioned synthetic fixture queue (not an arbitrary development repo):
+
+```powershell
+python -B -m orchestrator phase2-supervise-mock --repo '<fixture-repo>' --database '<external controller DB>' --run-root '<fixture run root>' --evidence-mode OFFLINE_TEST --review-registry '<pinned external registry>' --registry-sha256 '<hash>' --validator-registry '<pinned validator registry>' --validator-sha256 '<hash>' --max-active 2 --max-seconds 30
+python -B -m orchestrator phase2-review-challenge --repo '<fixture-repo>' --database '<same DB>' --evidence-mode OFFLINE_TEST --review-registry '<same registry>' --registry-sha256 '<hash>' --task-id '<task>'
+python -B -m orchestrator phase2-import-review --repo '<fixture-repo>' --database '<same DB>' --evidence-mode OFFLINE_TEST --review-registry '<same registry>' --registry-sha256 '<hash>' --envelope '<signed fixture envelope>'
+python -B -m orchestrator phase2-merge-check --repo '<fixture-repo>' --database '<same DB>' --evidence-mode OFFLINE_TEST --review-registry '<same registry>' --registry-sha256 '<hash>' --task-id '<task>' --integration-repo '<integration fixture>' --integration-head '<40hex SHA>' --candidate-head '<40hex SHA>'
+```
+
+## Continuation verification — 2026-10-08
+
+| Actual command / check | Result | Evidence / limit |
+|---|---|---|
+| `python -B -m unittest discover -s orchestrator_tests -v` | PASS, 93 tests / 31.895s | `runs/orchestrator-completion-final-20261008.txt` |
+| Root Jev command from `tests/README.md` | PASS, 77 tests / 3.539s | `runs/jev-completion-20261008.txt`; no provider |
+| `python -B -m unittest test_inventory` in payload/jev | PASS, 12 tests / 0.018s | `runs/inventory-completion-20261008.txt` |
+| Completion/adversarial subset | 18 included in 93 | Signature spoof/replay/expiry/concurrent/cross-queue, artifact/receipt drift, DAG inputs, cancel/restart/lost supervisor ownership, validator exit/timeout, merge conflicts and existing CLI response compatibility |
+| CLI `phase2-supervise-mock --help` | PASS parsing | The full lifecycle is exercised through API integration tests, not a production CLI run |
+| Actual independent native Astra task review | BLOCKED / NOT_RUN | Signed fixtures assert synthetic fields; production importer rejects even a valid attester signature |
+| Native worker smoke | NOT_RUN this continuation; prior preflight failed | Separate native diagnostic; no loosened controls |
+| Actual local/remote merge | NOT_RUN | Executor is disabled; only isolated object-store conflict validation runs |
+
+The first full candidate run had 1 failure and 2 errors (83 tests). After correcting Windows text newline drift and security findings, a targeted run exposed a missing test import and overly restrictive local-clone transport. Both were fixed, the targeted eight-test set and full 92-test set passed. Final diff inspection restored the existing CLI `executed=False` response field and added a compatibility check; the final source passed 93 tests. Earlier failures are not counted as passing runs.
+
+The new signed fixtures generate disposable synthetic keys under ignored `.test-runs`; no private key, production registry, credentials, SQLite queue or runtime evidence is tracked. Independent architecture/security reviewers read the source and saved test evidence; they did not independently rerun tests or act as counted worker reviewers. Security closure accepts only OFFLINE_TEST and production fail-closed boundaries. Original Global production runtime and Jev payload are unchanged.
 
 ## KEEP / MODIFY / ADD
 
@@ -105,11 +144,12 @@ Use fresh smoke run roots. Queue reopen needs the same source/config/session bin
 ## Remaining acceptance and blockers
 
 - DONE: custom configuration composition/provenance; tested durable lifecycle primitives; B exact-capability routing without Jev; bounded single mock attempt/evidence; review/merge rejection gates.
-- PARTIAL: full Rule-Based Orchestrator. Continuous replenishment supervisor/shared cross-queue slot ledger, dependency artifact snapshots, general project validators, trusted review importer and conflict-tested local merge validation are source gaps.
+- DONE in OFFLINE_TEST: trusted fixture importer, accepted dependency snapshots, continuous bounded supervisor, pinned synthetic command validators and isolated local merge conflict validation.
+- PARTIAL: full Rule-Based Orchestrator. Observed native review importer and production repo validators are not released; no shared cross-queue native slot ledger exists. The two-task cap is per controller, not authorization to run multiple controllers with native children.
 - BLOCKED: native CLI isolation/admission and real worker smoke under the current Windows runtime/profile. Worktree/Job/diff checks cannot replace actual worker-token filesystem/network/controller-custody canaries.
 - NOT STARTED: live E adapter, larger-worker capacity authorization and full B/E worker benchmark. Remote merge executor is intentionally excluded.
 
-These source gaps are separate from the native sandbox failure. Overall Phase 1–2 remains unaccepted until required features and real smoke are verified. No background worker/scheduler is installed.
+The native provenance/custody gaps remain distinct from completed synthetic source paths. Overall Phase 1–2 remains unaccepted until real smoke and required independent native review are verified. No background worker/scheduler is installed. Phase 3 entry conditions are not met.
 
 ## Phase 3 Jev adapter
 

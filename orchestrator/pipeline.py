@@ -1,7 +1,7 @@
 """Bounded v2 synthetic execution through the production-shaped lifecycle.
 
-Controller validator is fixed code. Config argv is never executed.
-Native launch and authenticated independent review are deliberately unavailable.
+Controller validation uses fixed code or an explicit external pinned registry.
+Native launch and observed native independent review remain unavailable.
 """
 import hashlib
 import json
@@ -25,7 +25,7 @@ def rule_route(policy, candidate_ids, *, capability, loads=None):
             'source': 'deterministic', 'provider_called': False, 'executed': False}
 
 
-def artifact_manifest(worktree, claim, baseline):
+def artifact_manifest(worktree, claim, baseline, *, general=False):
     task = claim['task']
     after = scan(worktree)
     changed = sorted(k for k in set(baseline) | set(after) if baseline.get(k) != after.get(k))
@@ -40,10 +40,10 @@ def artifact_manifest(worktree, claim, baseline):
         relative_file(name)
         if name not in task['allowed_files'] or name not in after:
             raise ContractError('EXPECTED_ARTIFACT_MISSING')
-    if task['tests'] != ['constant-json-v1']:
+    if not general and task['tests'] != ['constant-json-v1']:
         raise ContractError('EXECUTABLE_VALIDATOR_NOT_REGISTERED')
     # This oracle is deliberately narrow; worker-generated code is never imported.
-    for name in task['expected_artifacts']:
+    for name in ([] if general else task['expected_artifacts']):
         content = (worktree / name).read_bytes()
         value = json.loads(content)
         if (len(content) > 4096 or type(value) is not dict or set(value) != {'answer'}
@@ -52,16 +52,16 @@ def artifact_manifest(worktree, claim, baseline):
     return {'task_hash': claim['task_hash'], 'attempt_id': claim['attempt_id'], 'epoch': claim['epoch'],
             'base_sha': task['base_sha'], 'changed_files': changed,
             'artifacts': {name: after[name] for name in task['expected_artifacts']},
-            'validator': 'constant-json-v1',
+            'validator': 'registered-general' if general else 'constant-json-v1',
             'validator_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             'scope': 'PASS', 'validation': 'PASS', 'independent_review': 'NOT_RUN',
             'evidence_kind': 'MOCK_WORKER', 'sandbox_boundary': 'UNVERIFIED'}
 
 
-def mock_attempt(queue, root, repo, *, behavior='valid', timeout=5):
+def mock_attempt(queue, root, repo, *, behavior='valid', timeout=5, claim=None, stop=None, validators=None):
     if type(timeout) not in (int, float) or not 0 < timeout <= 600:
         raise ContractError('RUNTIME_BOUND')
-    claim = queue.claim(lease_seconds=min(600, timeout + 30), capabilities={'synthetic'})
+    claim = claim or queue.claim(lease_seconds=min(600, timeout + 30), capabilities={'synthetic'})
     if claim is None:
         return {'status': 'NO_READY_TASK'}
     timeout = min(timeout, claim['task']['budgets']['runtime_seconds'])
@@ -72,6 +72,10 @@ def mock_attempt(queue, root, repo, *, behavior='valid', timeout=5):
     worker = Path(__file__).with_name('mock_v2_worker.py')
     try:
         path, temp = allocate(root, repo, claim)
+        snapshot = None
+        if isinstance(queue, Phase2Queue):
+            from .snapshots import materialize
+            snapshot = materialize(queue, claim, path)
         for item in claim['task']['inputs']:
             if scan(path).get(item['path']) != item['sha256']:
                 raise ContractError('INPUT_SNAPSHOT_MISSING')
@@ -80,28 +84,23 @@ def mock_attempt(queue, root, repo, *, behavior='valid', timeout=5):
         if behavior == 'timeout':
             argv.append('--timeout')
         result = bounded_run(argv, cwd=path, stdin=canonical(claim['task']).encode(),
-                             timeout=timeout, before_terminate=lambda: queue.fence(claim, 'process_stop'))
+                             timeout=timeout, stop=stop, before_terminate=lambda: queue.fence(claim, 'process_stop'))
         if result['reason'] or result['returncode'] or not result['tree_empty']:
             queue.fence(claim, result['reason'] or 'process_failure')
             queue.cleanup(claim, tree_empty=result['tree_empty'])
             return {'status': 'REJECTED', 'reason': result['reason'], 'tree_empty': result['tree_empty']}
         if not queue.validating(claim):
             raise ContractError('STALE_RESULT')
-        receipt = artifact_manifest(path, claim, baseline)
+        validation = validators.run(claim, path, stop=stop) if validators else []
+        receipt = artifact_manifest(path, claim, baseline, general=validators is not None)
+        receipt['validator_evidence'] = validation
+        receipt['snapshot_hash'] = snapshot['snapshot_hash'] if snapshot else None
         receipt['process_tree_empty'] = result['tree_empty']
         receipt['process_boundary'] = result['process_boundary']
         receipt['returncode'] = result['returncode']
         folder = Path(root) / 'controller-artifacts' / claim['attempt_id']
         folder.mkdir(parents=True)
-        # Freeze immutable bytes in controller-owned evidence before acceptance.
-        for name, digest in receipt['artifacts'].items():
-            content = (path / name).read_bytes()
-            if hashlib.sha256(content).hexdigest() != digest:
-                raise ContractError('ARTIFACT_DRIFT')
-            target = folder / name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with target.open('xb') as stream:
-                stream.write(content)
+        receipt['artifact_manifest_hash'] = queue.artifacts.publish(claim, path, receipt['artifacts'])
         write_new(folder / 'manifest.json', receipt)
         if not queue.finish(claim, receipt, True):
             raise ContractError('STALE_PUBLICATION')

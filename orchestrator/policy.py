@@ -183,7 +183,7 @@ def compile_policy(repo, *, defaults=None, session=None):
         sources.append({"layer": "repo_jev", "path": str(jev_path), "sha256": digest})
         if jev.get('enabled') is False:
             provenance['routing.jev_enabled'] = len(sources) - 1
-    code_names = ("__init__.py", "contracts.py", "store.py", "policy.py", "tasks.py", "core_queue.py", "routing.py", "provision.py", "__main__.py", "phase2.py", "pipeline.py", "processes.py", "workspaces.py", "cli_adapter.py", "mock_v2_worker.py")
+    code_names = ("__init__.py", "contracts.py", "store.py", "policy.py", "tasks.py", "core_queue.py", "routing.py", "provision.py", "__main__.py", "phase2.py", "pipeline.py", "processes.py", "workspaces.py", "cli_adapter.py", "mock_v2_worker.py", "evidence.py", "snapshots.py", "validators.py", "supervisor.py", "merge_validation.py")
     code_hashes = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest() for name in code_names}
     return {"core_version": VERSION, "repo_identity": str(repo.resolve()).casefold(),
             "settings": base, "floors": deepcopy(FLOORS), "sources": sources,

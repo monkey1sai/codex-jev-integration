@@ -10,4 +10,4 @@ if '--timeout' in sys.argv:
 for name in task['allowed_files']:
     path = Path(name)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text('{"answer":42}\n', encoding='utf-8')
+    path.write_bytes(b'{"answer":42}\n')

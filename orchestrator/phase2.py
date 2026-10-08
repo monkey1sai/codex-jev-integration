@@ -14,7 +14,10 @@ ACTIVE = {'CLAIMED', 'RUNNING', 'VALIDATING', 'HELD'}
 
 
 class Phase2Queue(CoreQueue):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, evidence_mode='production', review_registry=None, registry_sha256=None, **kwargs):
+        if evidence_mode not in {'production', 'OFFLINE_TEST'}:
+            raise ContractError('EVIDENCE_MODE')
+        self.evidence_mode = evidence_mode
         super().__init__(*args, **kwargs)
         with self.transaction() as db:
             db.execute('CREATE TABLE IF NOT EXISTS phase2_binding(id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER)')
@@ -23,6 +26,19 @@ class Phase2Queue(CoreQueue):
                     raise ContractError('LEGACY_QUEUE_MIGRATION_REQUIRED')
                 db.execute('INSERT INTO phase2_binding VALUES(1,1)')
             db.execute('CREATE TABLE IF NOT EXISTS merge_queue(task TEXT PRIMARY KEY, receipt_hash TEXT, status TEXT, reason TEXT)')
+            db.execute('CREATE TABLE IF NOT EXISTS evidence_binding(id INTEGER PRIMARY KEY CHECK(id=1), mode TEXT, registry_hash TEXT, queue_id TEXT)')
+            db.execute('INSERT OR IGNORE INTO evidence_binding VALUES(1,?,?,?)', (evidence_mode, registry_sha256, uuid.uuid4().hex))
+            binding = db.execute('SELECT * FROM evidence_binding').fetchone()
+            if binding['mode'] != evidence_mode or binding['registry_hash'] != registry_sha256:
+                raise ContractError('EVIDENCE_BINDING_DRIFT')
+            self.queue_id = binding['queue_id']
+            db.execute('CREATE TABLE IF NOT EXISTS review_challenges(nonce TEXT PRIMARY KEY, task TEXT, target TEXT, used INTEGER DEFAULT 0)')
+            db.execute('CREATE TABLE IF NOT EXISTS reviews(task TEXT PRIMARY KEY, envelope TEXT, hash TEXT, source TEXT)')
+        from .evidence import ReviewTrust, ArtifactStore
+        self.trust = ReviewTrust(review_registry, registry_sha256, self.path.parent / 'review-verification', self.repo) if review_registry else None
+        if bool(review_registry) != bool(registry_sha256):
+            raise ContractError('TRUST_PIN_REQUIRED')
+        self.artifacts = ArtifactStore(self)
 
     @staticmethod
     def _event(db, key, name, **data):
@@ -133,6 +149,10 @@ class Phase2Queue(CoreQueue):
             if not self._current(db, claim, {'VALIDATING'}, now):
                 return False
             key, state = claim['task']['task_id'], 'REVIEW' if passed else 'FAILED'
+            if passed and receipt.get('artifact_manifest_hash'):
+                row = db.execute('SELECT * FROM tasks WHERE id=?', (key,)).fetchone()
+                manifest, sha = self.artifacts.verified(db, row)
+                self.artifacts.bind_receipt(manifest, sha, receipt)
             db.execute('UPDATE tasks SET state=?,receipt=?,expires=NULL WHERE id=?', (state, canonical(receipt), key))
             db.execute('DELETE FROM locks WHERE task=?', (key,))
             self._event(db, key, state, receipt_hash=fingerprint(receipt), epoch=claim['epoch'])
@@ -194,6 +214,78 @@ class Phase2Queue(CoreQueue):
     def merge_snapshot(self):
         with self.transaction() as db:
             return [dict(r) for r in db.execute('SELECT * FROM merge_queue ORDER BY rowid')]
+
+    def review_challenge(self, task_id, ttl=300):
+        self._fresh()
+        if type(ttl) is not int or not 1 <= ttl <= 600:
+            raise ContractError('REVIEW_TTL')
+        with self.transaction() as db:
+            row = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
+            if not row or row['state'] != 'REVIEW':
+                raise ContractError('REVIEW_STATE')
+            manifest, artifact_hash = self.artifacts.verified(db, row)
+            self.artifacts.bind_receipt(manifest, artifact_hash, json.loads(row['receipt']))
+            target = {'queue_id': self.queue_id, 'task_id': task_id, 'task_hash': row['hash'],
+                      'attempt_id': row['attempt_id'], 'epoch': row['epoch'], 'policy_hash': self.policy['policy_hash'],
+                      'receipt_hash': fingerprint(json.loads(row['receipt'])), 'artifact_hash': artifact_hash,
+                      'nonce': uuid.uuid4().hex, 'expires': time.time() + ttl,
+                      'worker_actor': manifest['worker_actor'], 'mode': self.evidence_mode,
+                      'purpose': 'codex-orchestrator/task-review/v1', 'registry_hash': self.trust.sha256 if self.trust else None}
+            db.execute('INSERT INTO review_challenges(nonce,task,target) VALUES(?,?,?)', (target['nonce'], task_id, canonical(target)))
+            return target
+
+    def import_review(self, envelope):
+        self._fresh()
+        if self.trust is None:
+            raise ContractError('TRUST_REGISTRY_REQUIRED')
+        kind, key_hash = self.trust.verify(envelope)
+        payload = envelope['payload']
+        if set(payload) != {'target', 'reviewer_id', 'decision', 'observed_model', 'observed_effort', 'execution_evidence_hash'}:
+            raise ContractError('REVIEW_SCHEMA')
+        target = payload['target']
+        if type(target) is not dict or payload['decision'] not in {'PASS', 'REJECT'}:
+            raise ContractError('REVIEW_SCHEMA')
+        if self.evidence_mode == 'production' and kind != 'native_attester':
+            raise ContractError('REQUIRED_MODEL_REVIEW_HELD')
+        if self.evidence_mode == 'OFFLINE_TEST' and kind != 'offline_fixture':
+            raise ContractError('REVIEW_REALM_MISMATCH')
+        rank = {'high': 0, 'xhigh': 1, 'max': 2, 'ultra': 3}
+        required = self.policy['settings']['roles']['reviewer']
+        if (payload['observed_model'] != required['model']
+                or rank.get(payload['observed_effort'], -1) < rank[required['reasoning_effort']]):
+            raise ContractError('REVIEW_MODEL_FLOOR')
+        import re
+        if not isinstance(payload['execution_evidence_hash'], str) or not re.fullmatch('[a-f0-9]{64}', payload['execution_evidence_hash']):
+            raise ContractError('REVIEW_EXECUTION_EVIDENCE')
+        with self.transaction() as db:
+            challenge = db.execute('SELECT * FROM review_challenges WHERE nonce=?', (target.get('nonce'),)).fetchone()
+            row = db.execute('SELECT * FROM tasks WHERE id=?', (target.get('task_id'),)).fetchone()
+            if not challenge or challenge['used'] or challenge['target'] != canonical(target):
+                raise ContractError('REVIEW_REPLAY_OR_UNKNOWN')
+            if (not row or row['state'] != 'REVIEW' or target['expires'] <= time.time()
+                    or row['attempt_id'] != target['attempt_id'] or row['epoch'] != target['epoch']
+                    or row['hash'] != target['task_hash'] or self.queue_id != target['queue_id']
+                    or self.policy['policy_hash'] != target['policy_hash']
+                    or fingerprint(json.loads(row['receipt'])) != target['receipt_hash']):
+                raise ContractError('STALE_REVIEW')
+            manifest, artifact_hash = self.artifacts.verified(db, row)
+            self.artifacts.bind_receipt(manifest, artifact_hash, json.loads(row['receipt']))
+            if artifact_hash != target['artifact_hash'] or payload['reviewer_id'] == manifest['worker_actor']:
+                raise ContractError('REVIEW_NOT_INDEPENDENT')
+            receipt = json.loads(row['receipt'])
+            if self.evidence_mode == 'production':
+                # A signed model-name assertion is not observed native provenance.
+                # Until the native reviewer execution ledger is wired and proven,
+                # even a pinned attester cannot release the production floor.
+                raise ContractError('REQUIRED_NATIVE_REVIEW_PROVENANCE_UNAVAILABLE')
+            db.execute('UPDATE review_challenges SET used=1 WHERE nonce=?', (target['nonce'],))
+            db.execute('INSERT INTO reviews VALUES(?,?,?,?)', (row['id'], canonical(envelope), fingerprint(envelope), kind))
+            state = 'PASSED' if payload['decision'] == 'PASS' else 'FAILED'
+            db.execute('UPDATE tasks SET state=? WHERE id=?', (state, row['id']))
+            db.execute('UPDATE merge_queue SET reason=? WHERE task=?', ('HUMAN_MERGE_AUTHORIZATION_REQUIRED' if state == 'PASSED' else 'REVIEW_REJECTED', row['id']))
+            self._event(db, row['id'], state, review_hash=fingerprint(envelope), reviewer_key=key_hash, evidence_mode=self.evidence_mode)
+            self._ready(db)
+            return {'state': state, 'evidence_mode': self.evidence_mode, 'review_hash': fingerprint(envelope), 'merge_executed': False}
 
     def merge(self, *args, **kwargs):
         raise ContractError('MERGE_EXECUTION_DISABLED')
