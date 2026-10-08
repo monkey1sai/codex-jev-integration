@@ -1,6 +1,6 @@
 # ADR / Delivery: Phase 1–2 incremental orchestrator
 
-Overall **PARTIAL**; native execution and observed native review **BLOCKED**. This continuation implements the requested five capabilities in an explicitly separated OFFLINE_TEST realm. It is not a completed production scheduler. Native diagnosis is in [native-sandbox-diagnostics.md](native-sandbox-diagnostics.md).
+Overall **PARTIAL**; production native execution and observed native review **BLOCKED**. The later diagnostic Linux smoke executed real tools and changed its fixture, but failed its boundary gate; no artifact was accepted. This continuation implements the requested five capabilities in an explicitly separated OFFLINE_TEST realm. It is not a completed production scheduler. Native diagnosis is in [native-sandbox-diagnostics.md](native-sandbox-diagnostics.md).
 
 ## Architecture and reuse
 
@@ -380,10 +380,114 @@ them or Phase 3 by itself.
 - DONE: custom configuration composition/provenance; tested durable lifecycle primitives; B exact-capability routing without Jev; bounded single mock attempt/evidence; review/merge rejection gates.
 - DONE in OFFLINE_TEST: trusted fixture importer, accepted dependency snapshots, continuous bounded supervisor, pinned synthetic command validators and isolated local merge conflict validation.
 - PARTIAL: full Rule-Based Orchestrator. Observed native review importer and production repo validators are not released; no shared cross-queue native slot ledger exists. The two-task cap is per controller, not authorization to run multiple controllers with native children.
-- BLOCKED: Windows native worker under the current policy; production review/provenance, validators and end-to-end admission. The Linux candidate's native commands/host preparation are verified, but a real model modification and acceptance are still missing.
+- BLOCKED: Windows native worker under the current policy; production review/provenance, validators and end-to-end admission. The latest Linux diagnostic worker made the expected modification, but its live boundary gate failed and controller validation/acceptance remain incomplete.
 - NOT STARTED: live E adapter, larger-worker capacity authorization and full B/E worker benchmark. Remote merge executor is intentionally excluded.
 
 The native provenance/custody gaps remain distinct from completed synthetic source paths. Overall Phase 1–2 remains unaccepted until real smoke and required independent native review are verified. No background worker/scheduler is installed. Phase 3 entry conditions are not met.
+
+## Newly authorized real smoke — 2026-10-08
+
+Base checkpoint: `8d26fb9302dd5895bfa426927c4a60e6ba4fcc97` on
+`feat/orchestrator-phase1-2`. **Smoke FAIL; Production Admission BLOCKED.**
+The explicit authorization allowed one additional CLI worker, not a retry of
+the original failed intent. Original intent/result/events hashes were checked
+before and after this attempt and remain unchanged.
+
+`tools/linux_worker_attempt.py` extends the existing smoke helper without
+changing production dispatch. A separate exclusive controller intent binds
+attempt `87c1e1d5-9186-4ed7-b006-4e780ec41980`, its public challenge, baseline
+snapshot, allowed file, literal argv and runtime pins. Never recreating that
+slot enforces no redispatch after failure or unknown completion. Its budget
+is now consumed. This is a controller-owned slot, not root-UID ownership.
+
+The parser uses only outer CLI JSONL frames, matches the full fixed canary
+command, pairs command starts/completions, binds the thread and challenge,
+and rejects failed, incomplete or replayed commands. Agent text and nested
+stdout cannot supply event provenance. A non-accepted candidate is verified
+before final PASS can be written; a failed verification leaves a failed final
+receipt. Production/review flags are always false. Six adversarial guards
+include a verifier-failure test of the actual candidate/final file writes.
+
+Zero-provider preflights exposed CLI scrubbing of externally injected session
+metadata and the fixed Bash command's observed `SHLVL=0`. Original assertion
+failures were retained. Rechecking the same native receipt, with independent
+architecture review, accepted only that exact shell value. Controller-injected
+metadata is explicitly not a model tool event. Live failure guards were not
+relaxed after dispatch.
+
+One real execution used pinned CLI 0.161.0, the pinned same-version official
+Code Mode Host and configured `gpt-6.1-sol / medium`. Its argv is in
+`dispatch-intent-copy.json` and `worker-events-execution.json`; the operator
+invocation was `wsl.exe --distribution Ubuntu-24.04 --exec /usr/bin/python3 -B`
+followed by the ignored run's `invoke_attempt.py --execute`. There was no
+second invocation. Thread: `01a11a68-72d1-7d80-b9d8-33e381a1cfb2`.
+
+| Evidence | Actual result | Acceptance |
+|---|---|---|
+| `item_2`, fixed Python boundary command | Real command start/completion, exit 0; thread/challenge match | Tool execution VERIFIED; boundary FAIL |
+| Live login-home write canary | `credential_home_write.access=ALLOWED` | Violates the required deny assertion; no smoke PASS |
+| Controller/other-worktree/home reads, Git/bin writes, sockets/TCP | Expected deny results in the live canary | Verified for these specific operations only |
+| `item_4`, file change | Actual patch of `artifact/mathutil.py`; controller snapshot confirms sole changed path | Scope VERIFIED, artifact NOT_ACCEPTED |
+| `item_5`, worker test | Real `/usr/bin/python3 -B test_mathutil.py`, exit 0, `ACCEPTANCE_PASS` | Worker self-test VERIFIED; separate controller Validator NOT_RUN |
+| Runtime lifecycle | CLI exit 0; observed cgroup/resource limits; empty remaining PID list | Exit/cleanup VERIFIED; exit alone does not approve task |
+| Fresh controller audit / public `--verify` | Hashes, rejected artifact and boundary failure rechecked; verifier exit 1 | Durable failure preserved, no accepted restart receipt |
+
+Observed rejected artifact SHA-256:
+`ba1a531f581d2e6094e978ed6f7aca7a8d92eeb62c6e7ad73ee692f7f18bc772`.
+The change is `return a - b` to `return a + b`; the controller's pure AST
+check did not execute this code. Only a rejected copy/manifest of diagnostic
+facts was preserved. No accepted artifact or controller validation was made.
+
+Live `credential_home_write` targeted the public test path
+`runtime-home/write-canary`. A later host-side read-only check found that path
+absent. Thus the runtime namespace write is verified, while host credential
+modification is not established. The live policy path differs from the
+zero-provider command/exec preflight; private overlay behavior requires
+source confirmation before selecting a correction. No credentials were read
+or copied, and the failure cannot be relabeled PASS.
+
+Version-matched official source confirms that minimal-read Linux isolation
+starts with a private `--tmpfs /` and adds scoped mounts
+([bwrap.rs](https://github.com/openai/codex/blob/rust-v0.161.0/codex-rs/linux-sandbox/src/bwrap.rs#L386));
+Landlock FS is disabled inside this bwrap path because mounts provide FS
+isolation ([linux_run_main.rs](https://github.com/openai/codex/blob/rust-v0.161.0/codex-rs/linux-sandbox/src/linux_run_main.rs#L220)).
+This source mechanism is VERIFIED; the exact live caller/mount that created
+the login-home parent remains UNKNOWN. No evidence establishes an actual
+grant to the full host CODEX_HOME.
+
+The controller currently checks canary semantics after the worker turn.
+Because the reporting canary returned exit 0, the worker proceeded to the
+legal patch and self-test. This is not an online admission gate. A future
+preflight must cover the same live tool runtime's permission/mount composition
+before dispatch, and canary semantic failure must stop subsequent execution.
+First collect public mount metadata in a separately authorized zero-provider
+diagnostic; do not relax this guard or launch another model under this budget.
+
+Evidence is retained under ignored `runs/wsl-worker-authorized-20261008/`:
+authorization plan, current effective config, immutable result, raw events,
+execution receipt, intent copy, rejected artifact/diff, restart rejection and
+`failed-attempt-restart-audit.json`. `post-run-containment.json` additionally
+rechecks those hashes/snapshot in another fresh process and confirms the
+dedicated unit is inactive/dead, MainPID 0, with its cgroup absent.
+Original failed evidence remains in
+`runs/wsl-worker-20261008/`. Actual model usage: input 59572, cached input
+43264, output 301, reasoning output 0. These are CLI-reported usage, not
+provider attestation of actual model/effort. Code Mode ancestry remains
+NOT_DIRECTLY_OBSERVED in the public JSONL interface.
+
+Post-attempt regression commands all passed:
+
+- `python -B -m unittest discover -s orchestrator_tests -v`: 116, 29.744s.
+- Root Jev command in `tests/README.md`: 77, 3.148s.
+- `python -B -m unittest test_inventory` in `payload/jev`: 12, 0.020s.
+
+Total **205 PASS**, retaining the 199 baseline tests plus six new guards.
+Actual logs: `runs/regression-{orchestrator,jev,inventory}-authorized-20261008.log`.
+Independent development source review accepted the final receipt ordering;
+it is not counted production reviewer evidence. Production Reviewer Provenance,
+general production validator admission and end-to-end PASSED remain BLOCKED.
+No Global/runtime policy, ACL, child limit or remote operation was changed.
+No Phase 3 or benchmark was started; no worker remains from this run.
 
 ## Phase 3 Jev adapter
 
