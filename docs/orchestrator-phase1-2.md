@@ -649,3 +649,99 @@ Production Reviewer Provenance、Production Validator 與完整 E2E。
 實際 tool namespace 保存 policy/mount evidence 並在修改前阻擋；相似 sandbox、
 本地重新編譯 harness 或 controller 簽章不能自行證明 release binary continuity。
 未啟用 Phase 3、未提高 children、未改 Global production、未 push/PR/merge。
+
+## External Containment Executor PoC — 2026-10-08
+
+以 `823515cdc080aedb45f67730969de026244d6282` 為基準。裁決為
+**NO-GO（目前 Executor 導入）／Production Admission BLOCKED**。
+這次只建立並執行一個零 Provider PoC，沒有建立 Worker dispatch、修改歷史
+attempt 或啟動模型。此次失敗是 PoC 的程序識別假設未成立，不能推論官方
+`exec-server` 接點不支援。
+
+### 實作與重用
+
+`tools/external_executor_poc.py` 是獨立實驗入口，沒有接入 scheduler 或改動
+既有 native admission hard block。重用 pinned 官方 CLI/bwrap、
+`run_cgroup` 的 timeout/limits/cleanup、既有 mount parser、network gate、
+artifact tree/hash 與 exclusive durable writes，沒有新增依賴或替代 patch 工具。
+
+實際 CLI `0.161.0` 的 `exec-server --help` 支援 experimental stdio service、
+`--concurrent-requests 1` 及 `--exit-on-stdin-close`。這是 release help 證據；
+本次未通過 gate，因此 server startup/protocol compatibility 尚未驗證。
+RPC 參數參照固定官方 source commit
+[`979011409de0a60b52f179721948e65531d26144`](https://github.com/openai/codex/blob/979011409de0a60b52f179721948e65531d26144/codex-rs/exec-server-protocol/src/protocol.rs)。
+source schema 不替代實際 release RPC 驗證。
+
+外層計畫為新 user/pid/net/ipc namespace、readonly tmpfs root、readonly
+runtime/system binaries、僅 synthetic workspace 可寫且 `.git` readonly、
+private scratch、無 credentials/controller/worktree/Windows host mounts。
+Controller 從實際 `/proc/<pid>` 讀取 executable、mountinfo、namespace、
+capabilities、NoNewPrivs 與 network evidence；gate receipt 持久化後才發 `G`。
+CLI exec 後還必須核對 pin 與 namespace continuity，才允許 modifying RPC。
+process RPC 刻意不提供 optional inner sandbox，測試惡意 request 仍受外層
+floor 約束；此路徑不宣稱原 native policy 或 live tool PASS。
+
+最終 verdict 同時要求實際 RPC/artifact 驗收及 cgroup exit、kernel limits、
+reader closure、輸出上限、無殘留程序。RPC 子集成功不能掩蓋清理失敗。
+沒有 local fallback，正式 Worker admission 一律 BLOCKED。
+
+### 唯一實跑結果與停止原因
+
+Run ID：`be38f571-6210-419f-8bba-675fec823369`。
+Evidence 位於 ignored `runs/external-executor-poc-20261008/`，只含公開 canary。
+`custody.json` SHA-256：
+`a72a46622ad04c45300328cc5e8420dbc9f1907ab21435bb76305cad71f71fc9`。
+
+Controller 收到 `bwrap --info-fd` 的 `child-pid=15919`，其 `/proc/.../exe`
+hash 為 pinned bwrap `77360cb7…e62c4c`，不是預期 Python bootstrap。
+因此拒絕 `EXECUTABLE_MISMATCH`；沒有 gate receipt，沒有送 `G`，沒有
+exec Codex，`rpc-trace.json=[]`，`changed_files=[]`。
+artifact SHA 保持
+`e1a894022d1a082987b87adecb623438c9e386d86b2b621cff4a5fe7fdf7edc8`。
+
+| 項目 | 實際結果／scope |
+|---|---|
+| Release 接點 help／CLI+bwrap pins | VERIFIED；不是 service startup PASS |
+| 外層 namespace/mount observations | 已保存 bwrap init 實際 mountinfo；不等於 payload boundary VERIFIED |
+| Bootstrap/payload PID/executable binding | FAIL；尚未建立可信 payload 綁定 |
+| Pre-execution fail-closed | VERIFIED：沒有 G、RPC 或修改 |
+| Shell/process、filesystem RPC | NOT_RUN，不能標為 isolation PASS |
+| Live unified-exec、apply_patch、Code Mode Host | NOT_RUN／UNKNOWN，沒有等價性或 routing coverage 證據 |
+| Protected paths、credentials、Git、network | init observations 已保存；實際修改／讀取拒絕驗證 NOT_RUN |
+| Cancellation/timeout | Worker/process RPC NOT_RUN；本次拒絕後強制 launcher 結束已記錄 |
+| cgroup limits/cleanup | VERIFIED：1 GiB、swap 0、64 tasks、無殘留 PID、reader 關閉 |
+| Restart custody audit | HASHES_VERIFIED；fresh controller 重算 verdict 仍 BLOCKED |
+| Production Reviewer / Validator / E2E | BLOCKED；本次没有改變既有 gates |
+
+獨立 security reviewer 已唯讀核對 raw run、custody hashes、artifact 起始與
+結束 hash、空 trace 和 cgroup evidence，接受停止並保存 NO-GO checkpoint。
+此 review 是 advisory，沒有匯入 Task REVIEW→PASSED，也不是 provider attestation。
+
+本輪停止此執行路線，不再啟動 Executor、standalone canary 或 Worker。
+最小必要修正是以可信 kernel ancestry 識別實際 bootstrap/payload，不能把
+bwrap init PID 當 payload。修正亦須重新驗證全部 mount/network gate 條件；
+本次 raw mountinfo 的 device bind propagation tags 與 loopback IPv6 route
+尚未被 gate 驗收，不能刪除未知或直接放寬 predicate。
+
+若選擇替代路線，應評估將整個 Codex CLI/Code Mode Host/所有 tool descendants
+置於獨立、無 controller/host mounts 的 Linux VM；避免只隔離 exec-server 而
+local tool 留在外部。該路線 NOT_STARTED，需要另外驗證 filesystem、credentials
+broker、network、cancellation/custody；不能憑 VM 名稱宣稱安全。
+目前沒有可授予下一個 Real Worker Smoke 的完整 admission evidence。
+
+### 重啟核對與回歸
+
+本輪 fresh controller 實跑：
+
+```text
+python3 -I -B tools/external_executor_poc.py --audit --run-root <existing-PoC-run>
+=> custody=HASHES_VERIFIED, verdict=BLOCKED, admission=BLOCKED
+```
+
+此 audit 不啟動 subprocess、模型或 executor，也不重新核發 intent。
+14 項新測試涵蓋 gate ordering/replay、missing mounts、policy/pin mismatch、
+host carveout、readonly Git/runtime、protected visibility、network floor、
+RPC allowlist、protocol error 不算存取拒絕，以及 lifecycle failure 不得假 PASS。
+原 220 項保留；回歸結果記錄於 `runs/regression-*-external-executor-20261008.log`。
+本輪全部實跑 **234 PASS**：Orchestrator 145（41.916s）、Jev 77（3.881s）、
+Inventory 12（0.020s）。離線 guard tests 不作為實際 Executor containment PASS。
