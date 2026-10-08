@@ -45,10 +45,14 @@ def task(queue):
                 'Windows drive prefix, NUL, ill-formed Unicode, duplicate encoded names and UTF-8 byte length >65535. '
                 'Preserve valid nested/Unicode names, roundtrip, CRC32, deterministic bytes and empty archive. '
                 'Do not add case-folding, NFC normalization or Windows device-name policy. '
+                'Read scripts/zip.d.mts and tsconfig.json as readonly context: createZip is declared to return Uint8Array. '
+                'Keep that public contract; use DataView and TextDecoder in TypeScript tests, not Buffer-only readUInt methods or toString(encoding). '
                 'First add one real negative Vitest regression and run only tests/zip.test.ts to observe its expected failing assertion; '
                 'then fix source and extend boundary cases within the SAME turn recovery budget (3 failures/60s). '
                 'Use node --v8-pool-size=2 node_modules/vitest/vitest.mjs run tests/zip.test.ts --configLoader native --maxWorkers 1 --no-file-parallelism --pool threads. '
-                'Node is on PATH. Use Code Mode tools. Do not run npm install, full suite or Build; Controller runs them. '
+                'Before completing the SAME turn run node --v8-pool-size=2 node_modules/typescript/bin/tsc --noEmit, '
+                'and fix any ordinary TypeScript error within the existing recovery budget. '
+                'Node is on PATH. Use Code Mode tools. Do not run npm install, full suite or Vite Build; Controller runs them. '
                 'Do not change gameplay/assets/Unity/config/instructions or other files. Keep existing tests.',
         'inputs': [], 'dependencies': [], 'allowed_files': ALLOWED, 'capability': 'game_packaging',
         'execution': {'role': 'worker', **queue.policy['settings']['roles']['worker'], 'native_children': 0},
@@ -61,12 +65,13 @@ def task(queue):
         'review': {'required': True, 'independent': True}}
 
 
-def native_check(runner, workspace, folder, name, argv, *, write=False):
-    settings, fs = runner._settings(workspace, ALLOWED if write else [], runner.queue.policy['settings']['roles']['worker'], [argv[0]])
+def native_check(runner, workspace, folder, name, argv, *, write=False, role='worker'):
+    expected_role = runner.queue.policy['settings']['roles'][role]
+    settings, fs = runner._settings(workspace, ALLOWED if write else [], expected_role, [argv[0]])
     command = {'argv': argv, 'timeout_seconds': 120}
     plan = {'plan_hash': fingerprint(command), 'workspace': str(workspace), 'command': command,
             'server_argv': runner._argv(workspace, settings, server=True), 'expected_filesystem': fs,
-            'check_thread_start': name == 'readiness'}
+            'check_thread_start': name in {'readiness', 'review-readiness'}}
     path = folder / (name + '-plan.json')
     frozen_bytes(path, canonical(plan).encode())
     driver = SOURCE / 'tools/development_validator.py'
@@ -76,6 +81,18 @@ def native_check(runner, workspace, folder, name, argv, *, write=False):
     if (not process_clean(result) or result['status'] != 'EXITED' or result['exit_code'] != 0
             or data.get('status') != 'PASS' or data['result']['exitCode'] != 0):
         raise ContractError('ZERO_PROVIDER_CHECK_FAILED:' + name)
+    observed = data['effective_config']
+    if (observed.get('model') != expected_role['model']
+            or observed.get('model_reasoning_effort') != expected_role['reasoning_effort']
+            or observed.get('approvals_reviewer') != 'auto_review'):
+        raise ContractError('ZERO_PROVIDER_ROLE_MISMATCH:' + name)
+    if plan['check_thread_start']:
+        started = next(item['result'] for item in data['trace'] if item.get('id') == 4 and 'result' in item)
+        if (started.get('model') != expected_role['model']
+                or started.get('reasoningEffort') != expected_role['reasoning_effort']
+                or started.get('approvalPolicy') != 'never'
+                or started.get('approvalsReviewer') != 'auto_review'):
+            raise ContractError('ZERO_PROVIDER_SESSION_MISMATCH:' + name)
     return {'execution': result, 'native': data}
 
 
@@ -138,7 +155,7 @@ def prepare(args):
         for name, config in VALIDATORS.items()}}
     frozen_bytes(root / 'controller/validator-registry.json', canonical(registry).encode())
     queue, adapter, runner = open_runner(root, args.runtime)
-    envelope = {'campaign_id': root.name, 'baseline_controller': 'c328366d2c8b0ecfba7c2394ee1ca7dda12c708f',
+    envelope = {'campaign_id': root.name, 'baseline_controller': 'e966826a9e772ad22448a88f43adbc236b63f19d',
         'game_base': GAME_BASE, 'worker_budget': 1, 'review_budget': 1, 'attempt_retry': 0,
         'destination': 'Official Codex provider via existing authenticated Linux CLI',
         'purpose': 'Public game ZIP hardening and independent review',
@@ -157,6 +174,8 @@ def prepare(args):
     try:
         results['readiness'] = native_check(runner, workspace, root / 'controller', 'readiness',
             [str(Path('/usr/bin/python3').resolve()), '-c', 'print("GAME_NATIVE_READY")'], write=True)
+        results['review_readiness'] = native_check(runner, workspace, root / 'controller', 'review-readiness',
+            [str(Path('/usr/bin/python3').resolve()), '-c', 'print("GAME_REVIEW_READY")'], role='reviewer')
         results['baseline_unit'] = native_check(runner, workspace, root / 'controller', 'baseline-unit', commands['game_unit'])
         results['baseline_build'] = native_check(runner, workspace, root / 'controller', 'baseline-build', commands['game_build'])
         if before != adapter.scan(workspace, ignore_scratch=True):

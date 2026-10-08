@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from orchestrator.contracts import canonical, ContractError
 from orchestrator.evidence import digest, frozen_bytes
@@ -188,3 +189,46 @@ class RealRepoAdapter(unittest.TestCase):
         (path / 'scripts/zip.mjs').unlink()
         with self.assertRaisesRegex(ContractError, 'REMOVAL_DRIFT'):
             self.adapter.scan(path)
+
+    def readiness_runner(self, data):
+        reviewer = {'model': 'gpt-6-astra', 'reasoning_effort': 'high'}
+        calls = []
+        def settings(workspace, allowed, role, reads):
+            calls.append((allowed, role))
+            return {}, {'.': 'read'}
+        def run(argv, folder, name, workspace, seconds, stop):
+            (folder / (name + '.jsonl')).write_text(canonical(data))
+            return {'status': 'EXITED', 'exit_code': 0}
+        runner = SimpleNamespace(queue=SimpleNamespace(policy={'settings': {'roles': {'reviewer': reviewer}}}),
+            _settings=settings, _argv=lambda *args, **kwargs: ['native-fixture'], _run=run)
+        return runner, calls
+
+    def readiness_data(self):
+        return {'status': 'PASS', 'result': {'exitCode': 0},
+            'effective_config': {'model': 'gpt-6-astra', 'model_reasoning_effort': 'high', 'approvals_reviewer': 'auto_review'},
+            'trace': [{'id': 4, 'result': {'model': 'gpt-6-astra', 'reasoningEffort': 'high',
+                       'approvalPolicy': 'never', 'approvalsReviewer': 'auto_review'}}]}
+
+    def test_reviewer_readiness_is_readonly_without_provider_turn(self):
+        from tools.game_repo_campaign import native_check
+        runner, calls = self.readiness_runner(self.readiness_data())
+        with patch('tools.game_repo_campaign.process_clean', return_value=True):
+            native_check(runner, self.repo, self.root, 'review-readiness', ['/bin/true'], role='reviewer')
+        self.assertEqual(calls, [([], {'model': 'gpt-6-astra', 'reasoning_effort': 'high'})])
+        plan = json.loads((self.root / 'review-readiness-plan.json').read_text())
+        self.assertTrue(plan['check_thread_start'])
+
+    def test_readiness_rejects_model_or_effort_mismatch(self):
+        from tools.game_repo_campaign import native_check
+        for field in ('effective_config', 'session'):
+            data = self.readiness_data()
+            if field == 'effective_config':
+                data['effective_config']['model'] = 'caller-self-reported'
+            else:
+                data['trace'][0]['result']['reasoningEffort'] = 'low'
+            runner, _ = self.readiness_runner(data)
+            folder = self.root / field
+            folder.mkdir()
+            with patch('tools.game_repo_campaign.process_clean', return_value=True):
+                with self.assertRaisesRegex(ContractError, 'MISMATCH'):
+                    native_check(runner, self.repo, folder, 'review-readiness', ['/bin/true'], role='reviewer')

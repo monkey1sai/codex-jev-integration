@@ -116,3 +116,10 @@ NOT_RUN：真實普通錯誤 same-turn recovery、修正後新 Worker、雙 Work
 先處理已存在 source file 的 dependency snapshot composition，不允許任意覆寫 base。
 只在隔離 integration 候選驗證，Merge 仍人工。Repo max_active=1 可依序執行兩任務，
 並行需另核對合法容量。這是未執行提案，不宣稱 modified upstream source 交付已驗收。
+
+## 2026-10-09 new Campaign 06
+
+以 e966826 為新基準及新額度執行，原 05 不變。Native warning suppression 已實際生效，
+Worker 真實修改兩檔、same-turn recovery 完成、Controller game tests 341 PASS；
+但新增 tests 不符合 Uint8Array 宣告，TypeScript Build FAIL，Task CANCELLED/NO_RETRY。
+Review 0、candidate 未 accepted/published。詳見 [06 actual report](game-repo-campaign-06.md)。
