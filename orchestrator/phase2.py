@@ -84,12 +84,16 @@ class Phase2Queue(CoreQueue):
                 db.execute("UPDATE tasks SET state='READY' WHERE id=?", (row['id'],))
                 self._event(db, row['id'], 'READY')
 
-    def claim(self, lease_seconds=180, now=None, *, capabilities=None):
+    def claim(self, lease_seconds=180, now=None, *, capabilities=None, halt_on_failure=False):
         self._fresh()
+        if type(halt_on_failure) is not bool:
+            raise ContractError('HALT_ON_FAILURE_TYPE')
         if type(lease_seconds) not in (int, float) or not 0 < lease_seconds <= 600:
             raise ContractError('LEASE_BOUND')
         now = time.time() if now is None else now
         with self.transaction() as db:
+            if halt_on_failure and db.execute("SELECT 1 FROM tasks WHERE state IN ('HELD','FAILED','CANCELLED') LIMIT 1").fetchone():
+                return None
             self._ready(db)
             cap = db.execute('SELECT active_cap FROM controller_binding').fetchone()[0]
             active = db.execute("SELECT count(*) FROM tasks WHERE state IN ('CLAIMED','RUNNING','VALIDATING','HELD')").fetchone()[0]

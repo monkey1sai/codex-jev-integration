@@ -279,6 +279,86 @@ class DevelopmentContracts(Fixture):
                 registry.run(claim, self.repo)
         launch.assert_not_called()
 
+    def test_existing_failure_prevents_native_claim_and_dispatch(self):
+        from unittest.mock import Mock
+        for state in ('FAILED', 'CANCELLED', 'HELD'):
+            with self.subTest(state=state):
+                queue = Phase2Queue(self.root / state / 'dev.sqlite', self.repo, evidence_mode='DEVELOPMENT')
+                a, b = self.task(), self.task(2)
+                b['allowed_files'] = ['tests/test_api.py']
+                queue.enqueue([a, b])
+                claim = queue.claim()
+                queue.start(claim)
+                if state == 'FAILED':
+                    queue.validating(claim)
+                    queue.finish(claim, {'process_tree_empty': True}, False)
+                else:
+                    queue.fence(claim)
+                    if state == 'CANCELLED':
+                        queue.cleanup(claim, tree_empty=True, retry=False)
+                before = queue.snapshot()
+                self.assertIsNone(queue.claim(halt_on_failure=True))
+                self.assertEqual(queue.snapshot(), before)
+                runner = Mock(dispatches=0)
+                result = Supervisor(queue, self.root, self.repo, max_active=2,
+                                    native_runner=runner, capabilities={'backend'}).run(max_seconds=3)
+                runner.attempt.assert_not_called()
+                runner.review.assert_not_called()
+                self.assertEqual(result['queue'], before)
+
+    def test_native_failure_cancels_other_worker_without_review(self):
+        import threading
+        queue = Phase2Queue(self.root / 'dev.sqlite', self.repo, evidence_mode='DEVELOPMENT')
+        a, b = self.task(), self.task(2)
+        b['allowed_files'] = ['tests/test_api.py']
+        queue.enqueue([a, b])
+        barrier = threading.Barrier(2)
+        class StubRunner:
+            dispatches = 2
+            cancelled = False
+            def attempt(self, claim, stop):
+                queue.start(claim)
+                barrier.wait(timeout=3)
+                if claim['task']['task_id'] == a['task_id']:
+                    queue.fence(claim, 'offline_failure_fixture')
+                    queue.cleanup(claim, tree_empty=True, retry=False)
+                    return {'status': 'BLOCKED', 'offline_stub': True}
+                self.cancelled = stop.wait(2)
+                queue.fence(claim, 'offline_cancel_fixture')
+                return {'status': 'HELD', 'offline_stub': True}
+            def review(self, task_id, stop):
+                raise AssertionError('REVIEW_AFTER_FAILURE')
+        runner = StubRunner()
+        result = Supervisor(queue, self.root, self.repo, max_active=2,
+                            native_runner=runner, capabilities={'backend'}).run(max_seconds=10)
+        self.assertTrue(runner.cancelled)
+        self.assertEqual(result['queue']['budget']['used'], 2)
+        self.assertNotIn('PASSED', {row['state'] for row in result['queue']['tasks']})
+
+    def test_review_failure_stops_before_second_review(self):
+        queue = Phase2Queue(self.root / 'dev.sqlite', self.repo, evidence_mode='DEVELOPMENT')
+        a, b = self.task(), self.task(2)
+        b['allowed_files'] = ['tests/test_api.py']
+        queue.enqueue([a, b])
+        class StubRunner:
+            dispatches = 2
+            reviews = []
+            def attempt(self, claim, stop):
+                queue.start(claim)
+                queue.validating(claim)
+                queue.finish(claim, {'process_tree_empty': True}, True)
+                return {'status': 'REVIEW', 'offline_stub': True}
+            def review(self, task_id, stop):
+                self.reviews.append(task_id)
+                with queue.transaction() as db:
+                    db.execute("UPDATE tasks SET state='FAILED' WHERE id=?", (task_id,))
+                return {'status': 'FAILED', 'offline_stub': True}
+        runner = StubRunner()
+        result = Supervisor(queue, self.root, self.repo, max_active=2,
+                            native_runner=runner, capabilities={'backend'}).run(max_seconds=10)
+        self.assertEqual(len(runner.reviews), 1)
+        self.assertEqual({row['state'] for row in result['queue']['tasks']}, {'FAILED', 'REVIEW'})
+
     def test_supervisor_renews_during_serial_native_review(self):
         import time
         queue = Phase2Queue(self.root / 'dev.sqlite', self.repo, evidence_mode='DEVELOPMENT')

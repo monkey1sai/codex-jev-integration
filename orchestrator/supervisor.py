@@ -68,8 +68,13 @@ class Supervisor:
             try:
                 while not self.stop.is_set() and time.monotonic() < deadline:
                     self._renew()
-                    while len(pending) < self.max_active:
-                        claim = self.queue.claim(lease_seconds=60, capabilities=self.capabilities)
+                    while len(pending) < self.max_active and not self.stop.is_set():
+                        if self.native_runner and any(r['state'] in {'HELD', 'FAILED', 'CANCELLED'}
+                                                      for r in self.queue.snapshot()['tasks']):
+                            self.stop.set()
+                            break
+                        claim = self.queue.claim(lease_seconds=60, capabilities=self.capabilities,
+                                                 halt_on_failure=self.native_runner is not None)
                         if claim is None:
                             break
                         if self.native_runner:
@@ -83,9 +88,24 @@ class Supervisor:
                         if self.native_runner:
                             # Review is serial and runs only after all workers stop:
                             # reviewer processes count toward the same capacity.
-                            for row in self.queue.snapshot()['tasks']:
+                            rows = self.queue.snapshot()['tasks']
+                            if any(r['state'] in {'HELD', 'FAILED', 'CANCELLED'} for r in rows):
+                                self.stop.set()
+                                break
+                            for row in rows:
+                                if self.stop.is_set():
+                                    break
                                 if row['state'] == 'REVIEW':
-                                    outcomes.append(self.native_runner.review(row['id'], self.stop))
+                                    try:
+                                        reviewed = self.native_runner.review(row['id'], self.stop)
+                                    except Exception as error:
+                                        reviewed = {'status': 'BLOCKED', 'task_id': row['id'], 'reason': type(error).__name__}
+                                    outcomes.append(reviewed)
+                                    if not isinstance(reviewed, dict) or reviewed.get('status') != 'PASSED':
+                                        self.stop.set()
+                                        break
+                            if self.stop.is_set():
+                                break
                             rows = self.queue.snapshot()['tasks']
                             if any(r['state'] in {'REVIEW', 'HELD', 'FAILED', 'CANCELLED'} for r in rows):
                                 break
@@ -101,10 +121,15 @@ class Supervisor:
                     for future in completed:
                         claim = pending.pop(future)
                         try:
-                            outcomes.append(future.result())
+                            outcome = future.result()
+                            outcomes.append(outcome)
+                            if self.native_runner and (not isinstance(outcome, dict) or outcome.get('status') != 'REVIEW'):
+                                self.stop.set()
                         except Exception as error:
                             self.queue.fence(claim, 'supervisor_exception')
                             outcomes.append({'status': 'HELD', 'reason': type(error).__name__})
+                            if self.native_runner:
+                                self.stop.set()
             finally:
                 # Cancel before executor shutdown waits, including lost-owner/claim exceptions.
                 self.stop.set()
