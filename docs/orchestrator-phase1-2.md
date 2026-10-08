@@ -141,6 +141,87 @@ The new signed fixtures generate disposable synthetic keys under ignored `.test-
 | ADD | Phase2Queue lifecycle, fixed mock pipeline/manifest, phase2 tests, benchmark plan/descriptive scorer, ADR |
 | REMOVE | Nothing |
 
+## Production admission continuation — 2026-10-08, after App recovery
+
+**Overall PARTIAL; Production Admission BLOCKED.** Extend the existing
+challenge/importer/registry rather than introduce a new approval framework.
+This checkpoint adds usable diagnostic and preflight APIs; it does not release
+native dispatch, production review/validators or merge. Phase 3 remains closed.
+
+| Component | Implemented and verified | Admission status |
+|---|---|---|
+| App tool sandbox | PowerShell starts after external recovery; App 26.930.7945.0, bundled CLI 0.160.1 | App tool observation, not worker proof |
+| Native readonly preflight | Official npm 0.161.0 command/exec reproduces root-read rejection in credential-free isolated config | BLOCKED; no requested command execution |
+| Review runtime ledger | Challenge/task/attempt/epoch/policy/artifact/receipt binding; immutable diagnostic receipt, restart/idempotent/orphan handling | DONE as diagnostics; official execution provenance BLOCKED |
+| Production importer | Missing execution receipt, hash mismatch and configured-metadata rejection; durable rejection audit outside failed transaction | BLOCKED even with valid synthetic native-attester signature |
+| Validator preflight | Complete registry/config/file/executable hash and literal argv checks; production blocked receipt/event, pre-cancel fence | DONE preflight; production command execution BLOCKED |
+| Real DAG → worker → validator → independent review → PASSED | Necessary native/reviewer conditions missing | NOT_RUN / BLOCKED |
+
+`Phase2Queue.record_review_runtime(target, started, completed)` accepts the
+shape of thread-start metadata and turn-completion metadata. Its source is
+explicitly `UNVERIFIED_CALLER_SUPPLIED_APP_SERVER_METADATA`. It stores only
+bounded allowlisted metadata and fixes observed_model/observed_effort to null;
+caller `trusted` flags, extra model claims and assistant text cannot change
+that. This is a diagnostic receipt, not a reliable execution receipt or signed
+provider attestation. Current installed protocol does not expose the required
+observed per-turn model/effort. The production hard reject remains unconditional.
+
+The `review_runtime` SQLite table and frozen `review-runtime/<nonce>.json`
+bind the diagnostic to the existing one-shot challenge. Import still rechecks
+expiry/current state/artifacts and does not consume the nonce on rejection.
+Rejection records contain only hashes/reasons under `review-admission/`, with
+corresponding durable events. Existing detached-signature verification is
+retained; disposable synthetic signatures prove rejection mechanics, not a
+real Astra review or production reviewer identity. No attester was enrolled.
+
+`ValidatorRegistry.plan(claim, workspace)` checks the full pinned command
+chain without execution and returns execution_authorized=false. Production
+`run()` records `NOT_RUN/BLOCKED` evidence and raises before process launch.
+OFFLINE_TEST retains real bounded execution of fixed synthetic validators,
+rechecks every pin/lease before launch, checks pre-cancellation before spawning,
+and binds execution receipts to queue/task/attempt/epoch/policy/plan hashes.
+Executable hashes do not solve custody or replacement races; native OS
+containment remains a prerequisite for worker-generated test code.
+
+The existing synthetic CLI plan now rejects a root-level named default
+permissions configuration when no legacy sandbox_mode is configured. This
+avoids silently replacing that profile with its legacy workspace-write flags.
+It is **not** full effective-layer resolution: repo/profile/managed layers
+remain UNVERIFIED, and the plan remains HELD. Existing model roles are unchanged.
+Source fingerprints include the new admission module; existing queues need
+deliberate policy/source migration rather than a silent source-binding update.
+
+Actual final regression commands from this worktree:
+
+| Command | Actual result | Retained evidence |
+|---|---|---|
+| `python -B -m unittest discover -s orchestrator_tests -v` | PASS: 105 / 26.696s | `runs/production-admission-full-20261008.txt` |
+| `python -B -m unittest test_response_diagnostics test_decision test_phase2a test_resources test_combined test_inventory_safety` | PASS: 77 / 2.761s | `runs/production-admission-jev-20261008.txt` |
+| `python -B -m unittest test_inventory` from payload/jev | PASS: 12 / 0.018s | `runs/production-admission-inventory-20261008.txt` |
+
+Total **194** tests; baseline was 182. The 12 added tests cover production
+receipt binding/no-PASS, forged signature rejection audit, missing/mismatched
+metadata, receipt tampering, expiry/cross-queue/drift, restart/orphan recovery,
+production validator no-host-fallback, literal argv/executable drift, cancellation,
+stale attempts and named-profile root-config rejection. Existing restart/DAG/
+supervisor-interruption/merge-conflict tests were rerun in the full suite.
+No test is counted as native sandbox, actual model review or real E2E PASS.
+
+Independent architecture and security reviewers inspected the scoped code/test
+diff. Architecture accepted only the fail-closed increment; security found no
+new production PASS/execute/merge bypass and requires follow-up for native
+custody, actual reviewer provenance and complete effective-layer validation.
+They did not independently run tests or act as counted task reviewers. Local
+merge execution and remote actions remain disabled. Details and minimum
+compatible repair are in [native-sandbox-diagnostics.md](native-sandbox-diagnostics.md).
+
+KEEP: model roles, Jev adapter, original tests, review/sandbox/auto-review floors.
+MODIFY: importer rejection evidence, validator preflight and CLI plan guard.
+ADD: diagnostic runtime ledger, admission receipts/events and 12 tests.
+REMOVE: nothing. No Global production runtime or capacity setting was changed.
+No live background scheduler/worker was installed. Phase 3 entry conditions
+are still not met; there is no pending request to enable routing or benchmark.
+
 ## Remaining acceptance and blockers
 
 - DONE: custom configuration composition/provenance; tested durable lifecycle primitives; B exact-capability routing without Jev; bounded single mock attempt/evidence; review/merge rejection gates.

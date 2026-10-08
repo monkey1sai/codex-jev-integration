@@ -30,6 +30,10 @@ def cli_plan(executable, worktree, temp, task, global_home):
     config_path = home / "config.toml"
     config_bytes = config_path.read_bytes()
     config = tomllib.loads(config_bytes.decode("utf-8-sig"))
+    if config.get('default_permissions') and 'sandbox_mode' not in config:
+        # Legacy flags would override a named profile, possibly broadening its
+        # read policy. This synthetic plan has no verified named-profile adapter.
+        raise ContractError('NAMED_PERMISSIONS_REQUIRE_VERIFIED_NATIVE_ADAPTER')
     role_path = home / "agents" / "worker.toml"
     role_bytes = role_path.read_bytes()
     role = tomllib.loads(role_bytes.decode("utf-8-sig"))

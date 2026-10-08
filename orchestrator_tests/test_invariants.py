@@ -285,6 +285,12 @@ class CliPlans(Fixture):
             with self.assertRaisesRegex(ContractError, "REVIEW_FLOOR"):
                 self.plan(task)
 
+    def test_named_permissions_cannot_be_silently_replaced_with_legacy_flags(self):
+        self.config.write_text('default_permissions = "minimal-read"\n', encoding='utf-8')
+        with patch('subprocess.Popen', side_effect=AssertionError('plan only')):
+            with self.assertRaisesRegex(ContractError, 'NAMED_PERMISSIONS_REQUIRE_VERIFIED_NATIVE_ADAPTER'):
+                self.plan()
+
 
 class Processes(Fixture):
     def test_accounting_settle_is_bounded_and_requires_zero(self):

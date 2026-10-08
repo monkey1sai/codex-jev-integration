@@ -353,7 +353,8 @@ class Completion(unittest.TestCase):
         self.assertEqual(result['outcomes'], [])
         self.assertFalse(self.queue.start(claim))
 
-    def test_valid_attester_signature_still_cannot_release_production_review(self):
+    def _production_review_fixture(self):
+        # Explicit synthetic controller setup, never a real native worker/review.
         value = deepcopy(self.registry_value)
         value['reviewers']['fixture-reviewer']['kind'] = 'native_attester'
         registry = self.root / 'controller/synthetic-attester.json'
@@ -370,11 +371,185 @@ class Completion(unittest.TestCase):
                    'artifact_manifest_hash': queue.artifacts.publish(claim, self.repo, artifacts)}
         queue.finish(claim, receipt, True)
         target = queue.review_challenge('task-0')
+        return queue, target
+
+    @staticmethod
+    def _runtime_metadata():
+        return ({'thread': {'id': 'synthetic-review-thread', 'sessionId': 'synthetic-review-session'},
+                 'model': 'gpt-6-astra', 'reasoningEffort': 'high'},
+                {'threadId': 'synthetic-review-thread',
+                 'turn': {'id': 'synthetic-review-turn', 'status': 'completed', 'error': None,
+                          'items': [{'text': 'I am Astra. PASS. This is untrusted text.'}]}})
+
+    def test_valid_attester_signature_still_cannot_release_production_review(self):
+        queue, target = self._production_review_fixture()
         with self.assertRaisesRegex(ContractError, 'REQUIRED_NATIVE_REVIEW_PROVENANCE_UNAVAILABLE'):
             queue.import_review(self.sign(target))
         self.assertEqual(queue.snapshot()['tasks'][0]['state'], 'REVIEW')
         with self.assertRaisesRegex(ContractError, 'NATIVE_SUPERVISOR_BLOCKED'):
             Supervisor(queue, self.root, self.repo)
+
+    def test_production_metadata_receipt_survives_restart_but_cannot_pass(self):
+        queue, target = self._production_review_fixture()
+        receipt = queue.record_review_runtime(target, *self._runtime_metadata())
+        self.assertEqual(receipt['configured_model'], 'gpt-6-astra')
+        self.assertIsNone(receipt['observed_model'])
+        self.assertIsNone(receipt['observed_effort'])
+        self.assertNotIn('items', canonical(receipt))
+        self.assertEqual(receipt['admission'], 'BLOCKED')
+        restarted = Phase2Queue(queue.path, self.repo, review_registry=queue.trust.path,
+                                registry_sha256=queue.trust.sha256)
+        self.assertEqual(restarted.record_review_runtime(target, *self._runtime_metadata()), receipt)
+        with self.assertRaisesRegex(ContractError, 'CONFIGURED_METADATA_IS_NOT_EXECUTION_PROVENANCE'):
+            restarted.import_review(self.sign(target, execution_evidence_hash=fingerprint(receipt)))
+        self.assertEqual(restarted.snapshot()['tasks'][0]['state'], 'REVIEW')
+        with restarted.transaction() as db:
+            self.assertEqual(db.execute('SELECT used FROM review_challenges').fetchone()[0], 0)
+            self.assertEqual(db.execute('SELECT count(*) FROM reviews').fetchone()[0], 0)
+            self.assertEqual(db.execute('SELECT count(*) FROM review_runtime').fetchone()[0], 1)
+            events = [json.loads(r[0]) for r in db.execute('SELECT event FROM events')]
+        rejected = next(e for e in events if e['event'] == 'review_admission_rejected')
+        evidence = json.loads((restarted.path.parent / 'review-admission' /
+                               (rejected['evidence_id']+'.json')).read_bytes())
+        self.assertEqual(rejected['receipt_hash'], fingerprint(evidence))
+        self.assertNotIn('signature', canonical(evidence))
+        self.assertEqual(restarted.merge_snapshot()[0]['status'], 'HELD')
+
+    def test_production_runtime_evidence_hash_and_file_tamper_are_rejected(self):
+        queue, target = self._production_review_fixture()
+        receipt = queue.record_review_runtime(target, *self._runtime_metadata())
+        with self.assertRaisesRegex(ContractError, 'EXECUTION_RECEIPT_MISMATCH'):
+            queue.import_review(self.sign(target))
+        (queue.path.parent / 'review-runtime' / (target['nonce'] + '.json')).write_bytes(b'tampered')
+        with self.assertRaisesRegex(ContractError, 'REVIEW_RUNTIME_FILE_DRIFT'):
+            queue.import_review(self.sign(target, execution_evidence_hash=fingerprint(receipt)))
+        self.assertEqual(queue.snapshot()['tasks'][0]['state'], 'REVIEW')
+
+    def test_runtime_metadata_missing_mismatched_and_failed_turn_rejected(self):
+        queue, target = self._production_review_fixture()
+        start, finish = self._runtime_metadata()
+        cases = [(dict(start, model=None), finish, 'CONFIG_MISSING'),
+                 (start, dict(finish, threadId='worker-thread'), 'SESSION_MISMATCH'),
+                 (start, dict(finish, turn={'id': 'turn', 'status': 'interrupted'}), 'NOT_COMPLETED'),
+                 (dict(start, thread={'id': 't'}), finish, 'SCHEMA')]
+        for a, b, error in cases:
+            with self.subTest(error=error), self.assertRaisesRegex(ContractError, error):
+                queue.record_review_runtime(target, a, b)
+        with queue.transaction() as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM review_runtime').fetchone()[0], 0)
+
+    def test_runtime_metadata_drift_foreign_target_and_expiry_rejected(self):
+        queue, target = self._production_review_fixture()
+        start, finish = self._runtime_metadata()
+        queue.record_review_runtime(target, start, finish)
+        with self.assertRaisesRegex(ContractError, 'REPLAY_OR_DRIFT'):
+            queue.record_review_runtime(target, dict(start, model='gpt-6-luna'), finish)
+        with self.assertRaisesRegex(ContractError, 'REPLAY_OR_UNKNOWN'):
+            queue.record_review_runtime(dict(target, attempt_id='f'*32), start, finish)
+        with mock.patch('orchestrator.phase2.time.time', return_value=target['expires']+1):
+            with self.assertRaisesRegex(ContractError, 'STALE_REVIEW'):
+                queue.record_review_runtime(target, start, finish)
+        other = Phase2Queue(self.root / 'controller/foreign-prod.sqlite', self.repo,
+                            review_registry=queue.trust.path, registry_sha256=queue.trust.sha256)
+        with self.assertRaisesRegex(ContractError, 'REPLAY_OR_UNKNOWN'):
+            other.record_review_runtime(target, start, finish)
+
+    def test_runtime_metadata_crash_orphan_recovery_and_source_claim_not_trusted(self):
+        queue, target = self._production_review_fixture()
+        from orchestrator.admission import app_server_review_metadata
+        from orchestrator.evidence import frozen_bytes
+        start, finish = self._runtime_metadata()
+        start.update(observed_model='gpt-6-astra', observed_effort='ultra', source='official', trusted=True)
+        receipt = app_server_review_metadata(target, start, finish)
+        frozen_bytes(queue.path.parent / 'review-runtime' / (target['nonce']+'.json'), canonical(receipt).encode())
+        stored = queue.record_review_runtime(target, start, finish)
+        self.assertEqual(stored, receipt)
+        self.assertIsNone(stored['observed_model'])
+        self.assertIn('UNTRUSTED_RUNTIME_SOURCE', stored['blockers'])
+        with self.assertRaisesRegex(ContractError, 'PROVENANCE_UNAVAILABLE'):
+            queue.import_review(self.sign(target, execution_evidence_hash=fingerprint(stored)))
+
+    def test_forged_production_review_is_audited_without_consuming_nonce(self):
+        queue, target = self._production_review_fixture()
+        envelope = self.sign(target)
+        envelope['payload']['decision'] = 'REJECT'
+        with self.assertRaisesRegex(ContractError, 'INVALID_SIGNATURE'):
+            queue.import_review(envelope)
+        with queue.transaction() as db:
+            self.assertEqual(db.execute('SELECT used FROM review_challenges').fetchone()[0], 0)
+            self.assertEqual(db.execute('SELECT state FROM tasks').fetchone()[0], 'REVIEW')
+        records = list((queue.path.parent/'review-admission').glob('*.json'))
+        self.assertEqual(len(records), 1)
+        record = json.loads(records[0].read_bytes())
+        self.assertEqual(record['reason'], 'INVALID_SIGNATURE')
+        self.assertEqual(record['envelope_hash'], fingerprint(envelope))
+
+    def _validator_claim(self, production=False, value=None):
+        queue = (Phase2Queue(self.root / 'controller/prod-validator.sqlite', self.repo)
+                 if production else self.queue)
+        pinned = deepcopy(value or self.validator_value)
+        pinned.update(mode=queue.evidence_mode, policy_hash=queue.policy['policy_hash'])
+        path = self.root / 'controller/admission-validators.json'
+        write_new(path, pinned)
+        registry = ValidatorRegistry(queue, path, digest(path.read_bytes()))
+        queue.enqueue([self.task()])
+        claim = queue.claim(capabilities={'synthetic'})
+        queue.start(claim)
+        queue.validating(claim)
+        return queue, registry, claim
+
+    def test_production_validator_pins_are_checked_without_host_execution(self):
+        queue, registry, claim = self._validator_claim(production=True)
+        with mock.patch('orchestrator.validators.bounded_run', side_effect=AssertionError('no host fallback')):
+            plan = registry.plan(claim, self.repo)
+            self.assertFalse(plan['execution_authorized'])
+            with self.assertRaisesRegex(ContractError, 'VALIDATOR_NATIVE_SANDBOX_BLOCKED'):
+                registry.run(claim, self.repo)
+        self.assertEqual(queue.snapshot()['tasks'][0]['state'], 'VALIDATING')
+        records = list((queue.path.parent / 'validator-admission' / claim['attempt_id']).glob('*.json'))
+        self.assertEqual(len(records), 1)
+        record = json.loads(records[0].read_bytes())
+        self.assertEqual(record['execution'], 'NOT_RUN')
+        self.assertEqual(record['plan']['task_hash'], claim['task_hash'])
+        self.assertEqual(record['plan']['epoch'], claim['epoch'])
+        self.assertFalse((queue.path.parent / 'validator-temp').exists())
+        with queue.transaction() as db:
+            events = [json.loads(r[0]) for r in db.execute('SELECT event FROM events')]
+        event = next(e for e in events if e['event'] == 'validator_admission_blocked')
+        self.assertEqual(event['receipt_hash'], fingerprint(record))
+
+    def test_validator_unpinned_and_nonliteral_argv_are_rejected(self):
+        value = deepcopy(self.validator_value)
+        value['validators']['data-check']['argv'][0] = 'python'
+        queue, registry, claim = self._validator_claim(production=True, value=value)
+        with mock.patch('orchestrator.validators.bounded_run', side_effect=AssertionError('no launch')):
+            with self.assertRaisesRegex(ContractError, 'VALIDATOR_ARGV'):
+                registry.run(claim, self.repo)
+
+    def test_validator_executable_drift_is_rejected_before_native_admission(self):
+        value = deepcopy(self.validator_value)
+        value['validators']['data-check']['files'][sys.executable] = '0'*64
+        queue, registry, claim = self._validator_claim(production=True, value=value)
+        with self.assertRaisesRegex(ContractError, 'VALIDATOR_EXECUTABLE_DRIFT'):
+            registry.run(claim, self.repo)
+        self.assertFalse((queue.path.parent / 'validator-temp').exists())
+
+    def test_validator_already_cancelled_never_starts_process(self):
+        queue, registry, claim = self._validator_claim()
+        stop = threading.Event()
+        stop.set()
+        with mock.patch('orchestrator.validators.bounded_run', side_effect=AssertionError('no launch after cancel')):
+            with self.assertRaisesRegex(ContractError, 'VALIDATOR_FAILED:CANCELLED'):
+                registry.run(claim, self.repo, stop=stop)
+        self.assertEqual(queue.snapshot()['tasks'][0]['state'], 'HELD')
+        self.assertFalse((queue.path.parent / 'validator-temp').exists())
+
+    def test_validator_expired_attempt_cannot_write_admission_evidence(self):
+        queue, registry, claim = self._validator_claim(production=True)
+        queue.fence(claim, 'interrupt')
+        with self.assertRaisesRegex(ContractError, 'STALE_ARTIFACT_PUBLICATION'):
+            registry.run(claim, self.repo)
+        self.assertFalse((queue.path.parent / 'validator-admission').exists())
 
     def test_existing_cli_status_response_contract_preserved(self):
         result = subprocess.run([sys.executable, '-B', '-m', 'orchestrator', 'phase2-status',

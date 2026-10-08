@@ -34,6 +34,7 @@ class Phase2Queue(CoreQueue):
             self.queue_id = binding['queue_id']
             db.execute('CREATE TABLE IF NOT EXISTS review_challenges(nonce TEXT PRIMARY KEY, task TEXT, target TEXT, used INTEGER DEFAULT 0)')
             db.execute('CREATE TABLE IF NOT EXISTS reviews(task TEXT PRIMARY KEY, envelope TEXT, hash TEXT, source TEXT)')
+            db.execute('CREATE TABLE IF NOT EXISTS review_runtime(nonce TEXT PRIMARY KEY, hash TEXT UNIQUE, receipt TEXT)')
         from .evidence import ReviewTrust, ArtifactStore
         self.trust = ReviewTrust(review_registry, registry_sha256, self.path.parent / 'review-verification', self.repo) if review_registry else None
         if bool(review_registry) != bool(registry_sha256):
@@ -235,6 +236,39 @@ class Phase2Queue(CoreQueue):
             return target
 
     def import_review(self, envelope):
+        try:
+            return self._import_review(envelope)
+        except ContractError as error:
+            if self.evidence_mode == 'production':
+                self._review_rejection(envelope, str(error))
+            raise
+
+    def _review_rejection(self, envelope, reason):
+        """Audit a rejection without trusting or persisting caller content."""
+        from .evidence import frozen_bytes
+        target = None
+        try:
+            data = canonical(envelope).encode()
+            envelope_hash = fingerprint(envelope) if len(data) <= 65536 else None
+            if type(envelope) is dict and type(envelope.get('payload')) is dict:
+                target = envelope['payload'].get('target')
+        except (TypeError, ValueError):
+            envelope_hash = None
+        evidence_id = uuid.uuid4().hex
+        receipt = {'evidence_id': evidence_id, 'queue_id': self.queue_id,
+                   'policy_hash': self.policy['policy_hash'], 'envelope_hash': envelope_hash,
+                   'admission': 'BLOCKED', 'reason': reason, 'mode': 'production'}
+        frozen_bytes(self.path.parent / 'review-admission' / (evidence_id + '.json'), canonical(receipt).encode())
+        with self.transaction() as db:
+            key = None
+            if type(target) is dict and isinstance(target.get('nonce'), str):
+                challenge = db.execute('SELECT task,target FROM review_challenges WHERE nonce=?', (target['nonce'],)).fetchone()
+                if challenge and challenge['target'] == canonical(target):
+                    key = challenge['task']
+            self._event(db, key, 'review_admission_rejected', evidence_id=evidence_id,
+                        receipt_hash=fingerprint(receipt), reason=reason)
+
+    def _import_review(self, envelope):
         self._fresh()
         if self.trust is None:
             raise ContractError('TRUST_REGISTRY_REQUIRED')
@@ -277,7 +311,15 @@ class Phase2Queue(CoreQueue):
                 # A signed model-name assertion is not observed native provenance.
                 # Until the native reviewer execution ledger is wired and proven,
                 # even a pinned attester cannot release the production floor.
-                raise ContractError('REQUIRED_NATIVE_REVIEW_PROVENANCE_UNAVAILABLE')
+                runtime = db.execute('SELECT * FROM review_runtime WHERE nonce=?', (target['nonce'],)).fetchone()
+                if not runtime:
+                    reason = 'MISSING_EXECUTION_RECEIPT'
+                elif runtime['hash'] != payload['execution_evidence_hash']:
+                    reason = 'EXECUTION_RECEIPT_MISMATCH'
+                else:
+                    self._runtime_file(target['nonce'], runtime['hash'])
+                    reason = 'CONFIGURED_METADATA_IS_NOT_EXECUTION_PROVENANCE'
+                raise ContractError('REQUIRED_NATIVE_REVIEW_PROVENANCE_UNAVAILABLE:' + reason)
             db.execute('UPDATE review_challenges SET used=1 WHERE nonce=?', (target['nonce'],))
             db.execute('INSERT INTO reviews VALUES(?,?,?,?)', (row['id'], canonical(envelope), fingerprint(envelope), kind))
             state = 'PASSED' if payload['decision'] == 'PASS' else 'FAILED'
@@ -286,6 +328,61 @@ class Phase2Queue(CoreQueue):
             self._event(db, row['id'], state, review_hash=fingerprint(envelope), reviewer_key=key_hash, evidence_mode=self.evidence_mode)
             self._ready(db)
             return {'state': state, 'evidence_mode': self.evidence_mode, 'review_hash': fingerprint(envelope), 'merge_executed': False}
+
+    def record_review_runtime(self, target, started, completed):
+        """Durably bind diagnostic metadata; this does not enroll an attester.
+
+        Reuses the review challenge and artifact custody checks. Recording does
+        not consume a nonce, change task state, or grant production admission.
+        """
+        self._fresh()
+        if type(target) is not dict:
+            raise ContractError('REVIEW_RUNTIME_TARGET')
+        from .admission import app_server_review_metadata
+        from .evidence import frozen_bytes, digest
+        with self.transaction() as db:
+            challenge = db.execute('SELECT * FROM review_challenges WHERE nonce=?', (target.get('nonce'),)).fetchone()
+            row = db.execute('SELECT * FROM tasks WHERE id=?', (target.get('task_id'),)).fetchone()
+            if not challenge or challenge['used'] or challenge['target'] != canonical(target):
+                raise ContractError('REVIEW_REPLAY_OR_UNKNOWN')
+            if (not row or row['state'] != 'REVIEW' or target['expires'] <= time.time()
+                    or row['attempt_id'] != target['attempt_id'] or row['epoch'] != target['epoch']
+                    or row['hash'] != target['task_hash'] or self.queue_id != target['queue_id']
+                    or self.policy['policy_hash'] != target['policy_hash']
+                    or fingerprint(json.loads(row['receipt'])) != target['receipt_hash']):
+                raise ContractError('STALE_REVIEW')
+            manifest, artifact_hash = self.artifacts.verified(db, row)
+            self.artifacts.bind_receipt(manifest, artifact_hash, json.loads(row['receipt']))
+            if artifact_hash != target['artifact_hash']:
+                raise ContractError('REVIEW_ARTIFACT_MISMATCH')
+            receipt = app_server_review_metadata(target, started, completed)
+            sha = fingerprint(receipt)
+            previous = db.execute('SELECT * FROM review_runtime WHERE nonce=?', (target['nonce'],)).fetchone()
+            if previous:
+                if previous['hash'] != sha:
+                    raise ContractError('REVIEW_RUNTIME_REPLAY_OR_DRIFT')
+                self._runtime_file(target['nonce'], previous['hash'])
+                return json.loads(previous['receipt'])
+            path = self.path.parent / 'review-runtime' / (target['nonce'] + '.json')
+            data = canonical(receipt).encode()
+            if path.exists():
+                # A controller crash after exclusive write but before DB commit
+                # may leave an identical orphan. Never overwrite different bytes.
+                from .evidence import guarded
+                if digest(guarded(path).read_bytes()) != sha:
+                    raise ContractError('REVIEW_RUNTIME_FILE_DRIFT')
+            else:
+                frozen_bytes(path, data)
+            db.execute('INSERT INTO review_runtime VALUES(?,?,?)', (target['nonce'], sha, canonical(receipt)))
+            self._event(db, row['id'], 'review_runtime_blocked', receipt_hash=sha,
+                        nonce=target['nonce'], blockers=receipt['blockers'])
+            return receipt
+
+    def _runtime_file(self, nonce, sha):
+        from .evidence import guarded, digest
+        path = guarded(self.path.parent / 'review-runtime' / (nonce + '.json'))
+        if not path.is_file() or digest(path.read_bytes()) != sha:
+            raise ContractError('REVIEW_RUNTIME_FILE_DRIFT')
 
     def merge(self, *args, **kwargs):
         raise ContractError('MERGE_EXECUTION_DISABLED')
