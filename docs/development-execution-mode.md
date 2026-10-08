@@ -84,3 +84,12 @@ CLI startup 可能有 provider metadata HTTP，零 inference 不等於完全無�
 
 M1/M2 的實際狀態、run ID、hash 與測試結果記錄在 Phase 1–2 ADR；
 未通過的步驟保持 BLOCKED/NOT_RUN，不使用離線 stub 補作 runtime PASS。
+
+最新 Campaign `development-campaign-20261008-96f3c4f5` 已取得三個真實 Task
+的修改、Controller Validation、獨立 Review 與 PASSED，並重核相依快照與 restart custody。
+Campaign 整體仍為 **PARTIAL**：乘法 Worker 有一筆 `python` exit 127，
+同 turn 改用 `python3` 後成功；較廣的「任何 FAIL 立即停止」沒有達成。
+目前 Supervisor 停損控制 attempt/validation/review，不能宣稱逐項工具即時取消。
+3 Worker＋3 Task Review 額度已用完，不重試；raw FAIL 與 Controller PASSED 均保留。
+完整證據、預算、限制與下一輪停止政策要求見
+[Phase 1–2 ADR](orchestrator-phase1-2.md) 的新 Campaign 記錄。

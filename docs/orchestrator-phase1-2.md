@@ -854,3 +854,134 @@ native thread 身分、published artifact 比對、scratch guard、validator 假
 本輪已另詢問後續範圍，答覆前不發出新模型請求：可用剩餘額度只完成新單 Worker，
 或取得完整新 1→2 envelope。所有後續測試使用全新 task/attempt；舊失敗 immutable。
 沒有修改 Global production、ACL、安全策略或 children ceiling；沒有 push、PR、merge。
+
+## Development M1 → M2 Campaign checkpoint — 2026-10-08
+
+本節是新 Campaign 的獨立結果，不改寫前節失敗或移轉其預算。
+使用者授權基準 `fa1cb70bf74c735a62dd365df43f335561ad75e8`，
+最多 3 次 Worker dispatch、3 次 Task Review turn、零自動重試，active≤2。
+Campaign ID：`development-campaign-20261008-96f3c4f5`；
+run ID：`e85df6ed1a9f4248a958ef135d33de68`；
+queue ID：`ddf96bb9` 前綴。實際執行來源 checkpoint：
+`fe68d2e3c5284ec55645996d1a2a27e1312938f6`。
+
+**整體 Campaign：PARTIAL。M1/M2 的既定技術驗收 PASS；嚴格「任何 FAIL
+立即停止」符合性 FAIL。** 下列事實分別記錄，不能以技術成功取代停止政策。
+
+### 最小修正與基準
+
+執行前 257 項既有測試全部實跑通過。Source recheck 發現 native Supervisor
+在失敗後可能繼續 claim 或 review。只延伸既有 Supervisor/Queue，沒有新調度框架：
+
+- Native claim 前檢查 FAILED/HELD/CANCELLED；同一 SQLite transaction 再檢查，
+  在 budget、lease 或 lock 改變前阻擋派工。
+- Native attempt 的非 REVIEW 結果、exception，或 Review 非 PASSED 結果，
+  觸發現有取消、fencing、cleanup；停止其他派工與後續 Review。
+- 新增三個因果 guard tests：既有失敗不能 claim、執行失敗取消另一 Worker、
+  第一個 Review 失敗不執行第二個。原 OFFLINE 行為保留。
+
+上述修正在本地 checkpoint `fe68d2e` 通過獨立 source review。
+**它控制 attempt/validation/review 層級，不是 live 每個工具項目的即時取消 gate。**
+本 Campaign 的後續工具失敗暴露了這個層級差異。
+
+### 真實派工、驗收與相依成果
+
+| 階段／Task | Attempt | Worker / Review native thread | 既定技術驗收 |
+|---|---|---|---|
+| M1 `dev-add-ddf96bb9` | `3aad7d7de36f4f00881cc7fbe75da354` | `01a11bc9-a92f-7010-9578-f58d0b12e150` / `01a11bc9-e512-7351-b483-de1be15f0459` | 真實 file_change、command；Controller 4 組斷言；獨立 Review PASS；Task PASSED |
+| M2 `dev-multiply-ddf96bb9` | `edb5a920fd1b4ad49f0022d7ba5c1626` | `01a11bca-1f68-7df0-98ff-063d6e3e889d` / `01a11bca-78f1-7ea2-b5a7-09f7d4811389` | 真實 file_change、成功 command；Controller 4 組斷言；獨立 Review PASS；Task PASSED；另有下述工具失敗 |
+| M2 `dev-subtract-ddf96bb9` | `eb31cae71500431d801131bf00b966af` | `01a11bca-1f97-7c23-8e91-fcbd210ba055` / `01a11bca-9d0c-7901-ade5-41a6517cf696` | 真實 file_change、command；Controller 4 組斷言；獨立 Review PASS；Task PASSED |
+
+M1 完整 PASSED 後，腳本重開 Controller 並驗證 custody，再自動加入兩個
+dependent tasks。兩者都綁 M1 manifest/review hash，取得相同
+`artifact/add.py` SHA-256 的快照，分配不同 detached worktrees。
+Queue events 證明上游 PASSED 早於兩個下游 CLAIMED；下游完成後 input hash
+仍一致。此 fixture 驗證交付與 dispatch ordering，不等於複雜 API/Build 相依驗收。
+
+兩個 M2 Worker 的實際 controller-observed PID 執行區間重疊 **9.141 秒**；
+active cap 沒有超過 2。Workers 結束後 serialized Review，各占同一容量治理。
+三個 artifact 在另外的隔離 worktree 做 **12 組 integration 斷言**，
+輸出 `ACCEPTANCE_PASS:integration`；base ref 未變，未執行 Git merge。
+Merge Queue 三列均為 `HELD / HUMAN_MERGE_AUTHORIZATION_REQUIRED`。
+
+| Artifact | SHA-256 |
+|---|---|
+| `artifact/add.py` | `59b422d2103632f1e0e580b334bbae30706ffd3004257085b632372ff030d6c4` |
+| `artifact/multiply.py` | `83b38b3130d12363cb70834b2e7a8d81de126563ef924f1970149dfe0f56a20b` |
+| `artifact/subtract.py` | `01a0a7861b37d40e66c3a22033dab45570a0852b5d5596f2e43b725b4fed91ec` |
+
+Controller final diff 各只有 assigned file；固定 `.tmp/` scratch 的零 byte native
+lock 分開保存 hash，不算 project diff。所有 scan 的 reparse、special-file、
+檔案數與大小限制仍套用。Native profile/CLI/Code Mode Host pins 未漂移，
+不是增加可寫 scope 或宣稱 OS 的精確 per-file 寫入阻擋。
+
+### 工具失敗與停止政策偏差
+
+乘法 Worker raw events `item_3`：`/bin/bash: line 1: python: command not found`，
+`exit_code=127`、`status=failed`，分類 `ENVIRONMENT_FAILURE`。
+`item_4` 在同一 native thread/turn 改用 `python3`，成功執行本地檢查，
+最後 `turn.completed`。沒有新增 attempt、dispatch 或重新開模型 turn；
+Controller pinned Validator 與獨立 Review 隨後都通過。
+
+此同 turn correction 不計為新的 Worker dispatch retry，但使用者的停止條件
+沒有事先限定 FAIL 層級，也沒有授權工具失敗後繼續的例外。
+**失敗當下並未立即停止，不能事後縮限授權文字而宣稱全程符合。**
+現有 `tool_evidence` 要求存在成功工具，completion gate 拒絕 turn/top-level failure；
+未實作逐項工具失敗即時取消。因此 `result.json` 的 Controller PASS 與三列
+Task PASSED 保留，Campaign 的無保留驗收不成立。
+
+`post-campaign-integrity.json` 額外檢查「所有個別工具成功」，aggregate 為 FAIL。
+其中新 79/79 與歷史 56/56 hashes 全一致；FAIL 來自上述一筆工具失敗，
+不是 artifact custody 破壞。此事後檢查亦不能冒稱執行中的阻擋。
+不將「所有工具零錯誤」反向加入既定 artifact/Task 驗收，再推翻有效測試與 Review。
+獨立唯讀 evidence/authorization review 確認上述分層；屬 advisory，不替代 Task Review。
+
+### Durable evidence、重啟與預算
+
+公開 evidence 位於 ignored `runs/development-campaign-20261008-96f3c4f5/`：
+
+- `authorized-plan.json`、`launch-plan.json`：新授權、來源 hashes、實際命令及預算。
+- `evidence/result.json`、`evidence/controller/`：native CLI JSONL、實際程序、
+  pinned validators、review intents/nonce/receipts、SQLite ledger、artifact manifests。
+- `restart-audit.json`：新的零推論 Controller 程序重開 Queue，重核 policy/config/pins、
+  artifacts、原始 events、Validator/Review receipt 與 dependency snapshots；
+  logical ledger 未變、budget 未重設、無新 dispatch。
+- `custody.json`：79 檔，SHA-256
+  `65184d2d95b7b22ca0bddc7b9c681e7edf6f50cc967d856c305bf3314cd54488`。
+- `post-campaign-integrity.json`：公開 copy 再驗 hashes、歷史 56 檔一致，
+  並保存個別 failed tool 的真實狀態。
+- `verification-results.json` 與三份 regression logs：實跑命令、exit codes、計數及 hashes。
+
+本 Campaign 消耗 **3/3 Worker dispatch、3/3 Task Review turn、0 次新 attempt retry**。
+零推論 readiness、Controller Validators、integration 與 custody audit 不算模型 turn；
+native startup 仍可能有 metadata HTTP。沒有回收或轉移歷史已用額度。
+各程序都有正向 cgroup cleanup/readers-closed evidence；fresh systemd 唯讀核對
+沒有仍在執行的 `codex-development-*.service`。
+
+Reviewer assurance 仍為 `CONTROLLER_EXECUTION_NATIVE_TRUST`，configured
+`gpt-6-astra/high`、獨立 native thread、真實 completion 與 challenge/artifact 綁定。
+`provider_attested_model=None` 不變；沒有恢復 High-Assurance Admission 開發。
+
+### 完成後回歸與最小下一步
+
+完整三組命令同前節，全部 exit 0、沒有 skipped：
+
+| Suite | 實跑結果 |
+|---|---|
+| Orchestrator | 171 PASS，44.136s |
+| Jev regression | 77 PASS，3.896s；零 Jev provider |
+| Inventory | 12 PASS，0.024s |
+| 合計 | **260 PASS**；原 257 保留，加 3 項停止 guard |
+
+本輪 **DONE（限既定技術驗收）**：單 Worker、兩個平行 dependent Workers、
+真實工具修改、Controller Validators、獨立 Review、artifact/input custody 與重啟核對。
+**PARTIAL（Campaign）**：立即停止政策存在上述偏差；不宣稱全域 Agent Factory
+或整個 Phase 1–2 無保留完成。原 High-Assurance Production Admission 保持 BLOCKED。
+真實 cancellation/timeout、故障中 restart、實際修改衝突未在此成功 Campaign 注入；
+既有回歸 guard 不冒稱這些 native 情境已驗收。M3、Phase 3、擴容 NOT_STARTED。
+
+到 3＋3 授權邊界停止，不再發模型請求。下一個最小修正是先明確制定下一輪
+stop policy 的 failure 層級；若仍要求任何工具 FAIL 即停，須在現有 native output
+reader 接入即時取消/fencing，不能用事後 audit 代替。也可在新的、明確授權契約
+允許同 turn 的無害工具環境修正；這不會追溯更改本輪偏差。
+任何新真實驗證需要新的 bounded envelope。沒有 Global 變更、push、PR 或 merge。
