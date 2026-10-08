@@ -49,3 +49,8 @@ The prior native App integration exposed all six tools and successfully called s
 - [Combined context and observation contract](docs/codex-jev-context.md)
 
 Global maintenance remains a separate operation: audit exact targets, stage verified backups and hashes, obtain applicable independent review, apply only the bounded diff, then verify the actual CLI/App and preserve concurrent changes. This repository does not provide the earlier machine-specific transactional installer.
+
+## Phase 1–2 orchestrator candidate
+
+隔離增量候選、操作命令與驗收缺口見 [Phase 1–2 ADR / delivery](docs/orchestrator-phase1-2.md)。
+標準庫 queue 與 mock worker 已接通；native worker、可信 review 匯入及實際 merge 保持 HELD。

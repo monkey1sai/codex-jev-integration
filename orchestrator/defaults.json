@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "roles": {
+    "planner": {"model": "gpt-6.1-sol", "reasoning_effort": "medium"},
+    "worker": {"model": "gpt-6.1-sol", "reasoning_effort": "medium"},
+    "researcher": {"model": "gpt-6-luna", "reasoning_effort": "medium"},
+    "reviewer": {"model": "gpt-6-astra", "reasoning_effort": "high"}
+  },
+  "scheduler": {"max_active": 2, "max_queued": 1000, "max_dispatches": 38, "max_attempts": 2},
+  "routing": {"strategy": "rules_then_jev", "jev_enabled": true},
+  "capabilities": {},
+  "validators": {},
+  "guidance": []
+}
