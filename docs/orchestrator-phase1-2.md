@@ -517,3 +517,135 @@ The twenty-worker live launcher is NOT IMPLEMENTED. No fabricated execution comm
 - [Non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode): supported CLI/JSONL interface instead of private App APIs.
 - [Windows sandbox](https://learn.chatgpt.com/docs/windows/windows-sandbox): native OS isolation must be verified independently.
 - [Permissions](https://learn.chatgpt.com/docs/permissions): effective permissions/managed constraints remain authoritative.
+
+## Zero-Provider containment diagnostics — 2026-10-08
+
+**PARTIAL / native admission BLOCKED.** Baseline
+`15284d0d0113a59be40148c3d9ec0c35be1802e2`. 本輪未建立 Worker dispatch、
+未發出 inference、未呼叫 Jev。既有兩個 Worker slots 的 intent、result 與 events
+hash 均未變；`87c1e1d5-9186-4ed7-b006-4e780ec41980` 仍是
+`FAILED_OR_UNKNOWN_NO_RETRY`，artifact 仍 NOT_ACCEPTED。
+
+### Live Unified-Exec Permission Trace
+
+| 節點 | 證據與界線 |
+| --- | --- |
+| 前次 live command | 保存的 `item_2` 確實執行固定 boundary command；`credential_home_write=ALLOWED`。當時沒有 mountinfo、mount ID 或 backing-device evidence，因此其分類仍 UNKNOWN。 |
+| Code Mode → delegate | 版本相符 [CodeModeService::execute](https://github.com/openai/codex/blob/rust-v0.161.0/codex-rs/core/src/tools/code_mode/mod.rs#L311) 建立 delegate，交給 [dispatch broker](https://github.com/openai/codex/blob/rust-v0.161.0/codex-rs/core/src/tools/code_mode/delegate.rs#L106)。這是 source evidence，並非前次事件的完整 ancestry receipt。 |
+| delegate → tools | broker 建立 `ToolCallRuntime`，經 [tools/parallel.rs](https://github.com/openai/codex/blob/rust-v0.161.0/codex-rs/core/src/tools/parallel.rs#L117) 分派 nested tool；需要 Session、StepContext 與 turn worker。 |
+| Unified-Exec → permissions | [unified_exec.rs](https://github.com/openai/codex/blob/rust-v0.161.0/codex-rs/core/src/tools/runtimes/unified_exec.rs#L205) 組合 turn permissions、additional permissions、shell snapshot 與選定 execution environment。前次 local/non-login command 與 native 分支相符，但事件不足以 attests 所有選擇及臨時 read grants。 |
+| Linux sandbox | [bwrap.rs](https://github.com/openai/codex/blob/rust-v0.161.0/codex-rs/linux-sandbox/src/bwrap.rs#L488) 的 restricted minimal-read 使用 tmpfs root 與 scoped binds；[linux_run_main.rs](https://github.com/openai/codex/blob/rust-v0.161.0/codex-rs/linux-sandbox/src/linux_run_main.rs#L220) 由該 mount view 提供 filesystem enforcement。 |
+| 零 Provider API | 官方 [command_exec_processor.rs](https://github.com/openai/codex/blob/rust-v0.161.0/codex-rs/app-server/src/request_processors/command_exec_processor.rs#L193) 是 standalone `build_exec_request` 路徑，並未走完整 Code Mode/ToolCallRuntime/Unified-Exec。已裝 schema 同樣區分此入口。`process/spawn` 與 unsandboxed shell 不被用作替代。 |
+
+因此本次診斷 scope 固定為 **LOWER_SANDBOX_ONLY / THIS_STANDALONE_PROBE_ONLY**。
+可證明該次觀測的 backing filesystem，不能代表前次 live tool。helper alias
+read grant 或合成 parent directory 是 source 可支持的候選解釋；未確認是前次
+`runtime-home/write-canary` 的建立原因，也未發現可證明 live-equivalent 的公開零 turn API。
+
+### 實際 Mount Namespace / Mountinfo Evidence
+
+最終診斷 ID：`a9064c19-d575-45d5-9760-86f38a481a6f`。
+durable evidence 位於 ignored `runs/wsl-mount-diagnostics-opaque-root-20261008/`。
+
+| 欄位 | 實際觀測 |
+| --- | --- |
+| Controller mount namespace | `mnt:[4026533274]` |
+| Command mount namespace，寫入前／後 | `mnt:[4026533447]`，相同且與 controller 不同 |
+| 根 mount | ID `1825`，device `0:338`，root `/`，point `/`，source/fstype `tmpfs`，mount/super options 均 rw |
+| Propagation | 根 mount optional fields 為空，無 shared/master/propagate_from；該 device 未出現在 host 前後 mountinfo |
+| 新公開 canary | 同一 O_EXCL fd 的 device `0:338`、inode `20`、78 bytes；實際 readback SHA-256 `9d0ae69d7579484ea5a6e21795a85e83ee7cda9cb5a72d0aa916bd65040a9cdc` |
+| Kernel restrictions | `CapEff=0`、`NoNewPrivs=1`、`Seccomp=2`；`/mnt/c` 與 `/init` 不可見 |
+| Host custody | 新公開 leaf 均未出現在 host，公開 sentinel 的 descriptor metadata 前後相同，fixture tree 與 runtime/attempt pins 未變。此敘述不涵蓋真憑證內容；未讀取其內容。 |
+
+`sandbox.mountinfo` 完整保存每個 mount，包含允許的 `.tmp`／`artifact` rw
+carveouts 及其受保護 metadata masks；沒有 runtime-home bind。stacked mountpoints
+不被任意挑選，classifier 對無法確定的 closest mount 維持 UNKNOWN。
+
+### Protected Path Access Matrix
+
+| 公開測試對象 | 固定指令 access observation | 分類與限制 |
+| --- | --- | --- |
+| runtime-home fake-secret / fresh write canary | open/write 均 ENOENT；parent 不在 view | WRITE_DENIED，僅本次 standalone |
+| controller / other-worktree sentinel 與 fresh leaf | open/write 均 ENOENT | WRITE_DENIED，僅本次 standalone |
+| fixture `.git/HEAD` / fresh `.git` leaf | open ALLOWED；write EROFS；mount `1841` ro/ext4 `8:80` | WRITE_DENIED；Git read 是既有合法權限 |
+| runtime bin fresh leaf | write EROFS；mount `1839` ro/ext4 `8:80` | WRITE_DENIED |
+| 私有 root fresh leaf | O_EXCL write/readback ALLOWED，完整正面 namespace/device/mount 證據 | PRIVATE_TMPFS_WRITE，VERIFIED 僅此 canary |
+| 前次 live `runtime-home/write-canary` | 前次 ALLOWED，缺少當時 mount/parent identity | UNKNOWN，不能回填 PRIVATE 或 PASS |
+
+本次 runtime-home ENOENT 與前次 live ALLOWED **不同**。host 看不到檔案本身不足以
+證明隔離；PRIVATE 分類另要求新 mount namespace、相符 stat device、fresh tmpfs
+device、exact root `/`、rw、無 propagation、完整 host custody。確認相同 host
+object 的 device/inode/hash 變更才分類 HOST_PROTECTED_PATH_WRITE。缺 metadata、
+混合／矛盾資料或 opaque root 均不能取得 PRIVATE。WRITE_DENIED 只記錄 syscall
+結果，不等於整個 namespace 或 production isolation PASS。
+
+### 診斷失敗與零 Provider 保證
+
+保留 `runs/wsl-mount-diagnostics-20261008/` 的第一次 pre-CLI 拒絕，以及
+`runs/wsl-mount-diagnostics-kernel-routes-20261008/` 的第二次 parser failure。
+它們是有不同實際證據支持的診斷修正，沒有建立或重試任何 Worker intent。
+Linux UAPI 的 RTF_REJECT `0x0200`／RTF_UP `0x0001` 說明新 network namespace
+可有不可用的 reject sentinel；gate 仍拒絕一般／UP routes。實際 mountinfo
+又顯示 `/bindfileHhNBBb//deleted` 的 opaque synthetic-mask root；parser 保留
+該 record，不將它正規化成 `/` 或略過，避免誤判最上層 tmpfs。
+
+官方 app-server [models refresh worker](https://github.com/openai/codex/blob/rust-v0.161.0/codex-rs/app-server/src/models_refresh_worker.rs#L38)
+在啟動時嘗試 Online metadata refresh。僅限制 RPC 不能證明 zero provider egress。
+所以整棵 app-server 程序樹先進入新的 user/network namespace，再在 CLI exec 前
+驗證非 root、only loopback、無 usable route、CapEff 0、NoNewPrivs 1。
+`offline-network-before-cli.json` 保存此證據。沒有 filesystem wrapper mount、
+配置／ACL 變更或未隔離 fallback。RPC 只含 initialize/config/read/command/exec。
+零 inference 與外部 provider network egress 被阻擋是已支持的主張；不能把
+`provider_requests: 0` 讀作 SDK 沒有在本機建立任何背景 HTTP 嘗試。
+
+Code Mode Host 另外重用 SHA-pinned protocol probe，實際確認 process/require/fetch/
+Deno/Bun undefined、dynamic/static node:fs imports 與 unlisted tool 被拒、純 JS
+回傳 5，無 delegate executor。`host-protocol-summary.json` scope 僅
+HOST_PROTOCOL_ONLY；它是 trusted native helper，沒有藉此證明 filesystem
+containment 或前次 live ancestry。Host 和 tool sandbox 的保證分別記錄。
+
+### Pre-Execution Admission Gate Result
+
+`tools/linux_containment.py` 是 stdlib parser/classifier 與 controller 診斷 receipt，
+未新增授權 broker。receipt 使用 exclusive durable write，綁定 challenge、配置、
+policy、CLI/bwrap/host、固定 probe 與 mountinfo hashes，含期限，固定
+`admission=BLOCKED`／`live_equivalence=UNKNOWN`。
+
+兩個既有 smoke 的 `--execute` 入口在 prepare、intent/evidence 寫入與 process
+dispatch **之前硬性拒絕**。caller 自稱 VERIFIED、有效／重播／過期 receipt，
+都沒有放行分支。這是已實作且測試的 **pre-dispatch hard block**；不是成功的
+live 即時 canary admission。完整同次 live 工具 namespace 的 containment gate
+仍 BLOCKED，不以事後檢查補充它。
+
+新 controller 的 `controller-restart-audit.json` 重新計算所有 receipt evidence
+hashes 與分類、核對原 slots/runtime/public metadata；actual-time stale receipt
+被拒，測試 snapshot time 仍回 LIVE_PATH_NOT_VERIFIED。診斷 unit 已
+inactive/dead、MainPID 0、cgroup 不存在。collect 中 app-server shutdown 超時後
+由 controller kill（server exit -9），讀取器關閉、無剩餘 cgroup PID；固定
+command exit 0 只表示收集完成，未提升為 Worker 或 production PASS。
+
+### 驗收與尚存阻礙
+
+15 項新增測試涵蓋 PRIVATE／HOST 分類、缺失 mount metadata、policy mismatch、
+stale/replay、caller forged metadata、兩個入口在 intent 前拒絕、fresh controller
+reopen，以及 public symlink/hardlink/collision 和 offline route gate。
+既有 205 項保留；本輪全部命令實跑，合計 **220 PASS**：
+
+- `python -B -m unittest discover -s orchestrator_tests -v`：131。
+- `python -B -m unittest test_response_diagnostics test_decision test_phase2a test_resources test_combined test_inventory_safety`：77。
+- payload/jev 的 `python -B -m unittest test_inventory`：12。
+
+log 為 `runs/regression-orchestrator-containment-final3-20261008.log`、
+`runs/regression-jev-containment-20261008.log`、
+`runs/regression-inventory-containment-20261008.log`。獨立 architecture/security
+source review 仍是 advisory，不是 Task REVIEW→PASSED 的 reviewer evidence。
+
+**DONE**：固定零 inference 下層收集、觀测分類、durable restart 核對與執行前
+硬拒絕。**PARTIAL**：Live Unified-Exec trace 的 source 部分。
+**BLOCKED**：前次 ALLOWED 的實際 backing filesystem、完整 live-equivalent
+零 Provider route、same-execution online admission、host filesystem assurance、
+Production Reviewer Provenance、Production Validator 與完整 E2E。
+最小必要下一步是可驗證的官方 live-tool 零 inference 入口／hook，能在同一次
+實際 tool namespace 保存 policy/mount evidence 並在修改前阻擋；相似 sandbox、
+本地重新編譯 harness 或 controller 簽章不能自行證明 release binary continuity。
+未啟用 Phase 3、未提高 children、未改 Global production、未 push/PR/merge。

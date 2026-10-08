@@ -17,6 +17,7 @@ import uuid
 from tools.linux_worker_smoke import (BWRAP_SHA, CLI_SHA, CODE_HOST_SHA, TEST_SHA,
     check_add_artifact, check_canaries, check_host_runtime, check_lifecycle,
     check_resource_limits, prepare, run_cgroup, sha, tree, write_new)
+from tools.linux_containment import require_native_admission
 
 BASE_CHECKPOINT = '8d26fb9302dd5895bfa426927c4a60e6ba4fcc97'
 OLD_INTENT_SHA = 'bc0e12a6964d52be021a38b1c3b01135e9100c1213e63f93f7f916bcf31fc6d9'
@@ -267,6 +268,10 @@ def main():
         if args.execute: raise ValueError('VERIFY_NEVER_DISPATCHES')
         print(json.dumps(verify(root, evidence, args.attempt_id, args.challenge), indent=2))
         return 0
+    if args.execute:
+        # This gate is before all intent/evidence writes and any worker process.
+        # Zero-provider standalone receipts cannot attest the live tool path.
+        require_native_admission()
     admission = args.admission_evidence
     if admission is None: raise ValueError('PREVIOUS_ADMISSION_EVIDENCE_REQUIRED')
     repo, cli, cfg, env = prepare(root, evidence)

@@ -225,3 +225,21 @@ Current evidence: `runs/wsl-worker-authorized-20261008/`.
 Post-run regressions: 116 Orchestrator + 77 Jev + 12 Inventory = 205 PASS.
 All original 199 tests are retained. No Windows preflight was repeated, no
 Global/ACL/native policy was changed, and no production gate was released.
+
+## Zero-Provider follow-up — 2026-10-08
+
+**PARTIAL / original live write UNKNOWN / Production Admission BLOCKED.**
+完整 source trace、matrix、classifier／pre-dispatch gate 與實際診斷結果見
+[ADR: Zero-Provider containment diagnostics](orchestrator-phase1-2.md#zero-provider-containment-diagnostics--2026-10-08)。
+最終 run `a9064c19-d575-45d5-9760-86f38a481a6f` 實測 standalone command/exec
+的 root write 為 PRIVATE_TMPFS_WRITE；runtime-home public read/write ENOENT。
+它沒有重現原 live ALLOWED，不能回填原 attempt 或宣稱 live-equivalent PASS。
+raw mountinfo 的 controller namespace `mnt:[4026533274]` 與 tool namespace
+`mnt:[4026533447]` 不同；private root mount `1825`／tmpfs device `0:338`。
+完整 ignored evidence：`runs/wsl-mount-diagnostics-opaque-root-20261008/`。
+先前兩筆診斷失敗亦保留；沒有模型／Jev／Worker dispatch 或消耗新 inference slot。
+app-server 的背景 metadata refresh 由 pre-CLI no-egress network namespace 阻擋，
+不以 RPC allowlist 宣稱 SDK 完全沒有 HTTP 嘗試。
+Code Mode Host 另驗證 protocol，OS filesystem assurance 仍 UNKNOWN。
+兩個 smoke execute 入口在 intent 前硬拒；完整 live 即時 admission 尚未取得。
+本輪回歸 131 Orchestrator + 77 Jev + 12 Inventory = 220 PASS，原 205 項保留。

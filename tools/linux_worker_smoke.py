@@ -350,6 +350,9 @@ def main():
     parser.add_argument('--execute', action='store_true', help='Consume the authorized one-worker budget; no automatic retry')
     args = parser.parse_args()
     root, evidence = args.root, args.evidence
+    if args.execute:
+        from tools.linux_containment import require_native_admission
+        require_native_admission()
     repo, cli, cfg, env = prepare(root, evidence)
     report = {'scope': 'SINGLE_SYNTHETIC_WORKER_SMOKE_ONLY', 'production_admitted': False,
               'review_passed': False, 'configured_model': 'gpt-6.1-sol', 'configured_effort': 'medium',
