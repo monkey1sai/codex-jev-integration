@@ -6,10 +6,19 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from tools.linux_worker_smoke import check_add_artifact, check_canaries, check_lifecycle, tree
+from tools.linux_worker_smoke import check_add_artifact, check_canaries, check_lifecycle, check_resource_limits, tree
 
 
 class LinuxSmokeGuards(unittest.TestCase):
+    def test_property_or_missing_kernel_limits_cannot_approve_runtime(self):
+        expected = {'memory.max': '1073741824', 'memory.swap.max': '0', 'pids.max': '64'}
+        check_resource_limits(expected)
+        for value in (None, {}, {'MemoryMax': '1073741824', 'TasksMax': '64'},
+                      {**expected, 'memory.max': 'max'}, {**expected, 'pids.max': 'max'}):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, 'KERNEL_RESOURCE_LIMITS_UNVERIFIED'):
+                    check_resource_limits(value)
+
     def test_import_exit_spoof_and_other_executable_constructs_rejected(self):
         check_add_artifact(b'def add(a, b):\n    return a + b\n')
         for source in (b'import os\nos.write(1, b"ACCEPTANCE_PASS\\n")\nos._exit(0)\n',

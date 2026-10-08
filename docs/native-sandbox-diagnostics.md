@@ -139,3 +139,35 @@ Reviewer admission separately needs a trusted controller transport/identity,
 challenge-bound execution receipts and actual model/effort provenance. Neither
 restoring App command execution nor signing configured metadata solves that
 gap. Production validators and real E2E therefore remain BLOCKED/NOT_RUN.
+
+## Isolated Linux real attempt — 2026-10-08
+
+The Windows root-read check was not repeated or relaxed. Isolated Linux
+official CLI 0.161.0 executed native bwrap/seccomp canaries within scoped
+artifact/scratch permissions. Controller/home/other-worktree paths were hidden,
+Git/runtime were read-only, networking/host sockets were denied. WSL alone
+remains unsuitable as the boundary; its host has writable DrvFS and privileged
+memberships. Admission facts are summarized in the ADR matrix.
+
+One actual provider turn ran with configured Sol/medium, thread
+01a11a1c-2581-7311-ad7b-4a142dacb24d. Exit 0, real token usage and empty cgroup
+were observed, but there was no file change or acceptance execution. The
+engine error was `Code Mode is unavailable because code-mode host is disabled`.
+This is a TOOL_FAILURE in controller runtime preparation, distinct from the
+Windows root-read incompatibility. The smoke is FAILED_OR_UNKNOWN_NO_RETRY;
+the exclusive original intent is retained and no second model was launched.
+
+Only the disposable runtime was repaired: official same-version host was
+hash-pinned and placed beside the custom CLI, and code_mode_host enabled.
+No production/global config or native sandbox policy was changed. Actual
+no-provider V8 protocol/API restrictions and host cancel/timeout/interruption
+passed. Kernel cgroup limits were read back, not inferred from properties:
+1 GiB memory, zero swap, 64 tasks/threads. Same-config native canaries and
+failure/restart also passed. Host protocol tests do not prove the full model
+tool chain or provider identity; that chain remains NOT_YET_VERIFIED.
+
+Readiness now reports PREPARED_REEXECUTION_REQUIRES_NEW_AUTHORIZATION (exit 2).
+The compatible candidate is ready for a separately authorized single attempt,
+with all production gates kept closed. Real artifact acceptance, independent
+review/provenance and production validator admission remain incomplete.
+There is no pending model/scheduler process launched by this continuation.

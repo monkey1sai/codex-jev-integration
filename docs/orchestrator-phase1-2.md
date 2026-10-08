@@ -259,10 +259,10 @@ remote tools and the CLI's automatically seeded builtin skills.
 | Git/runtime protection | UNKNOWN | UNKNOWN | `.git` and runtime bin writes EROFS |
 | Credentials/secrets | UNKNOWN | UNKNOWN | Actual isolated-home fake secret and fixture `.env` denied; official login status exit 0 |
 | Windows/privileged host channels | UNKNOWN | UNKNOWN | `/mnt/c`, `/init`, binfmt unavailable; `/run/WSL` empty; AF_UNIX/TCP EPERM |
-| Cancel, timeout, controller interruption | UNKNOWN | UNKNOWN | VERIFIED native fork/setsid cleanup with user cgroup |
+| Cancel, timeout, controller interruption | UNKNOWN | UNKNOWN | VERIFIED native fork/setsid and actual host cleanup in separate user cgroup tests |
 | Failure and fresh process restart | UNKNOWN | UNKNOWN | Native exit 7 retained; subsequent command succeeds |
-| Artifact custody | UNKNOWN | UNKNOWN | Bounded scan/pins implemented; real model artifact NOT_RUN |
-| Real model worker | NOT_RUN | NOT_RUN | READY; real model NOT_RUN at this pre-execution checkpoint |
+| Artifact custody | UNKNOWN | UNKNOWN | Bounded scan/pins implemented; first real attempt produced no artifact |
+| Real model worker | NOT_RUN | NOT_RUN | One real turn completed; modification/acceptance FAILED; no retry |
 
 The original process-group-only cancellation left native sandbox descendants.
 They later exited naturally; this is retained as FAIL, not retroactive PASS.
@@ -283,30 +283,91 @@ requires unchanged bytes/tree before custody. It is not a generic Python
 validator. No caller metadata, CLI exit or stdout marker grants production
 PASS or counted independent review.
 
-Readiness / explicitly authorized execution (inside Linux):
+Readiness (inside Linux; this does not authorize another model request):
 
 ```sh
 python3 -B tools/linux_worker_smoke.py --root <isolated-root> --evidence <owned-evidence-directory>
-# Only after readiness and the existing one-worker authorization:
-python3 -B tools/linux_worker_smoke.py --root <isolated-root> --evidence <owned-evidence-directory> --execute
+# The original --execute budget has been consumed. The retained intent blocks reuse.
 ```
 
 Local ignored evidence: `runs/wsl-worker-20261008/` contains release pins,
 actual argv, effective-config-admitted.json, cgroup-lifecycle-admitted.json,
 mutation-final-execution.json and output-final-execution.json. Final config
-SHA-256: f39081db3a690a9a8e5e8254bcd47cbac732ece85bda47defe3a5acac97f0d7b.
+SHA-256 before the first model: f39081db3a690a9a8e5e8254bcd47cbac732ece85bda47defe3a5acac97f0d7b.
 Prior failed receipts remain. No credentials are included or copied.
 
-Regression results: existing 105 orchestrator, 77 Jev and 12 Inventory tests
-all passed; four new deterministic rejection tests passed (198 total).
+Pre-execution regression results: existing 105 orchestrator, 77 Jev and 12
+Inventory tests all passed; four new guards passed (198 total).
 Actual native canaries are separate evidence, not mock worker results.
 Independent security review accepted the final bounded smoke design after
-fixing marker spoof, self-mutation and cgroup identity gaps. No model has yet
-been invoked by this runner. User's default-home CLI screenshot (Sol/low)
+fixing marker spoof, self-mutation and cgroup identity gaps. User's default-home CLI screenshot (Sol/low)
 does not establish this isolated home's login, medium effort or containment.
 The later official status check in the exact isolated environment returned
-exit 0 and the runner returned READY_NO_MODEL_LAUNCHED. The existing one-worker
-authorization now permits its one-shot execution without another approval.
+exit 0 and the runner returned READY_NO_MODEL_LAUNCHED. That one-worker
+authorization was then consumed by the real attempt below.
+
+### First real attempt and mandatory host repair
+
+Checkpoint 52c8cb99fe66fa06141584593b2951801b7534a1 preceded the model.
+One fresh ephemeral `codex exec --strict-config --ignore-rules --json`
+with Sol/medium completed real thread `01a11a1c-2581-7311-ad7b-4a142dacb24d`.
+Usage: input 21266, cached input 8832, output 167, reasoning output 59.
+CLI exit 0 and `turn.completed` establish an inference turn, not task success.
+No file changed; the validator was NOT_RUN. Overall smoke result is
+`FAILED_OR_UNKNOWN_NO_RETRY`, production/review flags remain false.
+
+Cause: the controller incorrectly disabled the mandatory `code_mode_host`
+feature. The engine explicitly reported Code Mode unavailable and requested
+the official host. This was a tool-runtime compatibility failure, not evidence
+of model task quality or sandbox failure. The original exclusive intent and
+failed receipt are retained; no automatic second model request was made.
+
+The same-version official host release archive SHA-256 is
+30cc945f77b3eed15ee385cc2f844a33bf1d7c422ff3a97161f701bffe4f77f8;
+ELF SHA-256 is e87096087c02aa6ab90a5a85031659665aa0bf3ee20c07ca0b8ab701c83fcd5b.
+Official install-context source resolves the helper beside this custom CLI.
+Only the isolated home's feature was changed to true; its prior config was
+preserved. New config SHA-256:
+53ba30443ce753d840150c2b669285470c8ce9a85d42ece17750dfa5e24ee081.
+Never, auto_review, Sol/medium, native permissions, network denial, disabled
+children/skills/plugins/MCP and all production policy floors remain in place.
+
+Actual no-provider stdio host tests verified pure JS output, unavailable
+process/require/fetch/Deno/Bun globals, static/dynamic import rejection and
+unknown-tool rejection. This is HOST_PROTOCOL_ONLY. No successful shell
+callback was fabricated; the CLI's full model-to-ToolCallRuntime chain remains
+NOT_YET_VERIFIED. Source review shows callbacks return to that policy path.
+The host itself is a trusted native V8 process, not an OS-sandboxed task shell;
+source/API checks cannot rule out native runtime vulnerabilities.
+
+Existing transient user cgroups now enforce kernel memory.max=1073741824,
+memory.swap.max=0 and pids.max=64, with exact observed ControlGroup binding.
+These are process/thread resource limits, not permission to add agent children.
+Actual host PID/executable/group were observed for cancel, timeout and
+controller interruption; all three left no cgroup processes. The same config
+also passed native canaries, lifecycle, exit-7 failure and fresh-process restart.
+No stress allocation, production service or other user session was touched.
+
+Evidence: `smoke-result.json`, `worker-events.jsonl`, `code-host-candidate.json`,
+`effective-config-code-host.json`, `cgroup-lifecycle-code-host.json`,
+`host-protocol-execution.json`, `host-protocol.jsonl`,
+`host-lifecycle-result.json` and `code-host-readiness.txt` under the same ignored
+run directory. The last readiness exits 2 with
+PREPARED_REEXECUTION_REQUIRES_NEW_AUTHORIZATION and provider_launches=0.
+One additional explicit attempt authorization is needed before re-execution;
+it must use separate evidence/intent and preserve the original failure.
+
+After the host repair, actual regression reruns passed: `python -B -m unittest
+discover -s orchestrator_tests -v` (110 tests, 28.731s), the root Jev command
+in `tests/README.md` (77 tests, 2.687s), and its payload Inventory command
+(12 tests, 0.015s). Total 199, retaining the original 194 and five guards.
+Final logs are `runs/wsl-admission-*-final-20261008.txt`. These offline tests
+remain separate from actual native/host probes and the failed real model.
+Independent security source/evidence review accepted this preparation scope,
+without granting production review or another provider attempt. Its cleanup
+finding was addressed by continuing evidence collection after a stop command
+timeout/error and retaining CLEANUP_UNVERIFIED. That infrastructure exception
+path was source-reviewed but not injected in a runtime test.
 
 Reviewer assurance: controller can bind executable/config/argv/process/
 artifact facts to this attempt; caller claims and assistant text are not
@@ -319,7 +380,7 @@ them or Phase 3 by itself.
 - DONE: custom configuration composition/provenance; tested durable lifecycle primitives; B exact-capability routing without Jev; bounded single mock attempt/evidence; review/merge rejection gates.
 - DONE in OFFLINE_TEST: trusted fixture importer, accepted dependency snapshots, continuous bounded supervisor, pinned synthetic command validators and isolated local merge conflict validation.
 - PARTIAL: full Rule-Based Orchestrator. Observed native review importer and production repo validators are not released; no shared cross-queue native slot ledger exists. The two-task cap is per controller, not authorization to run multiple controllers with native children.
-- BLOCKED: native CLI isolation/admission and real worker smoke under the current Windows runtime/profile. Worktree/Job/diff checks cannot replace actual worker-token filesystem/network/controller-custody canaries.
+- BLOCKED: Windows native worker under the current policy; production review/provenance, validators and end-to-end admission. The Linux candidate's native commands/host preparation are verified, but a real model modification and acceptance are still missing.
 - NOT STARTED: live E adapter, larger-worker capacity authorization and full B/E worker benchmark. Remote merge executor is intentionally excluded.
 
 The native provenance/custody gaps remain distinct from completed synthetic source paths. Overall Phase 1–2 remains unaccepted until real smoke and required independent native review are verified. No background worker/scheduler is installed. Phase 3 entry conditions are not met.

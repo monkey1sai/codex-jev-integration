@@ -19,10 +19,11 @@ import uuid
 
 CLI_SHA = '9a820c17865fa825d04db416818679a9d63bd72e50835c396f496e5684626c9c'
 BWRAP_SHA = '77360cb751ccedc5971391444ac86a8a33c15b04d6b4a6fe45f5d25496e62c4c'
+CODE_HOST_SHA = 'e87096087c02aa6ab90a5a85031659665aa0bf3ee20c07ca0b8ab701c83fcd5b'
 TEST_SHA = '2fe4181a4fc52bd647e904f01e45bb102d3f466cd6931c5d7b33cba40670c5be'
 DISABLED = ('multi_agent', 'multi_agent_v2', 'apps', 'plugins', 'hooks',
             'computer_use', 'browser_use', 'browser_use_external', 'in_app_browser',
-            'code_mode_host', 'daemon_auto_start', 'request_permissions_tool',
+            'daemon_auto_start', 'request_permissions_tool',
             'exec_permission_approvals', 'skill_mcp_dependency_install', 'skill_search',
             'workspace_dependencies', 'unbounded_connection_retries', 'remote_plugin',
             'auth_elicitation', 'tool_suggest')
@@ -112,6 +113,37 @@ def check_lifecycle(lifecycle, config_sha):
         raise ValueError('LIFECYCLE_ADMISSION_FAILED')
 
 
+def check_resource_limits(values):
+    if values != {'memory.max': '1073741824', 'memory.swap.max': '0', 'pids.max': '64'}:
+        raise ValueError('KERNEL_RESOURCE_LIMITS_UNVERIFIED')
+
+
+def check_host_runtime(evidence, root, config_sha):
+    lifecycle = json.loads((evidence/'host-lifecycle-result.json').read_text())
+    check_lifecycle(lifecycle, config_sha)
+    for case in lifecycle['cases']:
+        if case.get('host_executable') != str(root/'bin/codex-code-mode-host'):
+            raise ValueError('ACTUAL_HOST_EXECUTABLE_REQUIRED')
+        check_resource_limits(case.get('kernel_resource_limits'))
+    execution = json.loads((evidence/'host-protocol-execution.json').read_text())
+    if (execution.get('status') != 'EXITED' or execution.get('exit_code') != 0
+        or execution.get('output_limit_exceeded') or execution.get('remaining_cgroup_pids') != []):
+        raise ValueError('ACTUAL_HOST_PROTOCOL_EXECUTION_REQUIRED')
+    check_resource_limits(execution.get('kernel_resource_limits'))
+    data = json.loads((evidence/'host-protocol.jsonl').read_text())
+    responses = data.get('results', [])
+    if len(responses) != 5:
+        raise ValueError('HOST_PROTOCOL_CASES_REQUIRED')
+    values = [v['result']['value']['Result'] for v in responses]
+    texts = [[c.get('text') for c in v['content_items']] for v in values]
+    expected_globals = {name: 'undefined' for name in ('process', 'require', 'fetch', 'Deno', 'Bun')}
+    if (json.loads(texts[0][0]) != expected_globals or texts[1] != ['IMPORT_REJECTED']
+        or texts[2] != [] or values[2]['error_text'] != 'Unsupported import in exec: node:fs'
+        or texts[3] != ['UNKNOWN_TOOL_REJECTED'] or texts[4] != ['5']
+        or any(values[n]['error_text'] is not None for n in (0, 1, 3, 4))):
+        raise ValueError('HOST_API_RESTRICTIONS_NOT_VERIFIED')
+
+
 def check_add_artifact(data):
     """This tiny synthetic contract permits no import-time executable code."""
     if len(data) > 65536:
@@ -147,6 +179,8 @@ def run_cgroup(command, unit, seconds, repo, env, evidence, prefix):
     argv = ['/usr/bin/systemd-run', '--user', '--unit='+unit, '--pipe', '--wait', '--collect',
             '--property=KillMode=control-group', '--property=TimeoutStopSec=2s',
             '--property=RuntimeMaxSec='+str(seconds)+'s', '--property=SendSIGKILL=yes',
+            '--property=MemoryMax=1073741824', '--property=MemorySwapMax=0',
+            '--property=TasksMax=64',
             '/usr/bin/env', '-i', *[k+'='+v for k, v in env.items()], *command]
     record = {'argv': argv, 'unit': unit, 'status': 'STARTING'}
     exceeded = threading.Event()
@@ -177,10 +211,16 @@ def run_cgroup(command, unit, seconds, repo, env, evidence, prefix):
         while process.poll() is None and not exceeded.is_set() and time.monotonic() < deadline:
             if not record['unit_details']:
                 details = subprocess.run(['/usr/bin/systemctl', '--user', 'show', unit,
-                                          '--property=MainPID,ControlGroup,KillMode,RuntimeMaxUSec'],
+                                          '--property=MainPID,ControlGroup,KillMode,RuntimeMaxUSec,MemoryMax,MemorySwapMax,TasksMax'],
                                          env=control_env, capture_output=True, text=True, timeout=5)
                 if details.returncode == 0 and 'MainPID=0\n' not in details.stdout:
                     record['unit_details'] = details.stdout
+                    fields = dict(line.split('=', 1) for line in details.stdout.splitlines() if '=' in line)
+                    expected = '/user.slice/user-'+str(os.getuid())+'.slice/user@'+str(os.getuid())+'.service/app.slice/'+unit
+                    if fields.get('ControlGroup') == expected:
+                        folder = Path('/sys/fs/cgroup'+expected)
+                        record['kernel_resource_limits'] = {name: (folder/name).read_text().strip()
+                                                           for name in ('memory.max', 'memory.swap.max', 'pids.max')}
             time.sleep(.05)
         record['output_limit_exceeded'] = exceeded.is_set()
         if process.poll() is None:
@@ -192,9 +232,14 @@ def run_cgroup(command, unit, seconds, repo, env, evidence, prefix):
         record['error'] = type(exc).__name__+':'+str(exc)
         record['status'] = 'EXECUTION_UNKNOWN'
     finally:
-        stop = subprocess.run(['/usr/bin/systemctl', '--user', 'stop', unit], env=control_env,
-                              capture_output=True, timeout=10)
-        record['stop_exit'] = stop.returncode
+        try:
+            stop = subprocess.run(['/usr/bin/systemctl', '--user', 'stop', unit], env=control_env,
+                                  capture_output=True, timeout=10)
+            record['stop_exit'] = stop.returncode
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            record['stop_exit'] = None
+            record['stop_error'] = type(exc).__name__
+            record['status'] = 'CLEANUP_UNVERIFIED'
         if process is not None and process.poll() is None:
             process.kill(); process.wait(timeout=5)
         for handle in handles: handle.join(timeout=5)
@@ -207,6 +252,13 @@ def run_cgroup(command, unit, seconds, repo, env, evidence, prefix):
         remaining = []
         if observed != expected:
             record['status'] = 'CLEANUP_UNVERIFIED'
+        if any(details.get(key) != value for key, value in
+               {'MemoryMax': '1073741824', 'MemorySwapMax': '0', 'TasksMax': '64'}.items()):
+            record['status'] = 'RESOURCE_LIMITS_UNVERIFIED'
+        try:
+            check_resource_limits(record.get('kernel_resource_limits'))
+        except ValueError:
+            record['status'] = 'RESOURCE_LIMITS_UNVERIFIED'
         cgroup = Path('/sys/fs/cgroup'+expected)
         if observed == expected and cgroup.exists():
             for path in cgroup.rglob('cgroup.procs'):
@@ -231,6 +283,10 @@ def prepare(root, evidence):
     cfg = root / 'runtime-home/config.toml'
     if sha(cli) != CLI_SHA or sha(root/'bin/codex-resources/bwrap') != BWRAP_SHA:
         raise ValueError('OFFICIAL_BINARY_PIN_MISMATCH')
+    # Custom install-context "Other" resolves this helper beside the CLI.
+    host = root/'bin/codex-code-mode-host'
+    if host.is_symlink() or sha(host) != CODE_HOST_SHA:
+        raise ValueError('OFFICIAL_CODE_MODE_HOST_PIN_MISMATCH')
     conf = tomllib.loads(cfg.read_text())
     expected_keys = {'default_permissions', 'approval_policy', 'approvals_reviewer',
                      'model', 'model_reasoning_effort', 'web_search', 'analytics',
@@ -242,7 +298,8 @@ def prepare(root, evidence):
                        'model_reasoning_effort': 'medium', 'web_search': 'disabled'}.items():
         if conf[key] != value:
             raise ValueError('CONFIGURATION_FLOOR_MISMATCH:'+key)
-    if conf['features'] != {**{k: False for k in DISABLED}, 'skip_host_skill_discovery': True}:
+    if conf['features'] != {**{k: False for k in DISABLED},
+                            'skip_host_skill_discovery': True, 'code_mode_host': True}:
         raise ValueError('UNEXPECTED_FEATURE_OR_EXTERNAL_TOOL')
     permissions = {'worker-minimal': {'filesystem': {
         ':minimal': 'read', 'glob_scan_max_depth': 3, str(root/'bin'): 'read',
@@ -297,7 +354,8 @@ def main():
     report = {'scope': 'SINGLE_SYNTHETIC_WORKER_SMOKE_ONLY', 'production_admitted': False,
               'review_passed': False, 'configured_model': 'gpt-6.1-sol', 'configured_effort': 'medium',
               'provider_attested_model': None, 'provider_attested_effort': None,
-              'binary_sha256': sha(cli), 'config_sha256': sha(cfg), 'provider_launches': 0}
+              'binary_sha256': sha(cli), 'code_host_sha256': CODE_HOST_SHA,
+              'config_sha256': sha(cfg), 'provider_launches': 0}
     # The official CLI handles auth; never read/copy/print credential stores.
     auth = subprocess.run([str(cli), 'login', 'status'], env=env, cwd=repo,
                           capture_output=True, timeout=10)
@@ -308,9 +366,9 @@ def main():
         print(json.dumps(report, indent=2))
         return 2
     # These are controller-owned diagnostic receipts, never provider attestations.
-    lifecycle = json.loads((evidence/'cgroup-lifecycle-admitted.json').read_text())
+    lifecycle = json.loads((evidence/'cgroup-lifecycle-code-host.json').read_text())
     check_lifecycle(lifecycle, sha(cfg))
-    effective = json.loads((evidence/'effective-config-admitted.json').read_text())
+    effective = json.loads((evidence/'effective-config-code-host.json').read_text())
     if effective.get('config_sha256') != sha(cfg) or effective.get('error'):
         raise ValueError('CURRENT_EFFECTIVE_CONFIGURATION_REQUIRED')
     actual = effective['effective_config']
@@ -318,6 +376,15 @@ def main():
         if actual.get(key) != tomllib.loads(cfg.read_text())[key]:
             raise ValueError('EFFECTIVE_CONFIGURATION_MISMATCH')
     check_canaries(effective)
+    if actual.get('features', {}).get('code_mode_host') is not True:
+        raise ValueError('EFFECTIVE_CODE_MODE_HOST_REQUIRED')
+    check_host_runtime(evidence, root, sha(cfg))
+    report['code_host_protocol'] = 'VERIFIED_HOST_ONLY'
+    report['model_tool_dispatch'] = 'NOT_YET_VERIFIED'
+    if (root/'controller/smoke-intent.json').exists():
+        report['status'] = 'PREPARED_REEXECUTION_REQUIRES_NEW_AUTHORIZATION'
+        print(json.dumps(report, indent=2))
+        return 2
     if not args.execute:
         report['status'] = 'READY_NO_MODEL_LAUNCHED'
         print(json.dumps(report, indent=2))
@@ -346,7 +413,9 @@ def main():
     report['changed_paths'] = sorted(k for k in before.keys() | after.keys() if before.get(k) != after.get(k))
     if execution['status'] != 'EXITED' or execution.get('exit_code') != 0 or execution['output_limit_exceeded'] or report['changed_paths'] != ['artifact/mathutil.py']:
         report['status'] = 'FAILED_OR_UNKNOWN_NO_RETRY'
-    elif sha(cfg) != report['config_sha256'] or sha(cli) != CLI_SHA:
+    elif (sha(cfg) != report['config_sha256'] or sha(cli) != CLI_SHA
+          or sha(root/'bin/codex-code-mode-host') != CODE_HOST_SHA
+          or sha(root/'bin/codex-resources/bwrap') != BWRAP_SHA):
         report['status'] = 'FAILED_PIN_DRIFT_NO_RETRY'
     else:
         artifact = repo/'artifact/mathutil.py'
