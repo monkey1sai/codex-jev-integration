@@ -20,6 +20,7 @@ from .processes import jsonl_events
 from .pipeline import artifact_manifest
 from .snapshots import materialize
 from .workspaces import allocate, scan, git
+from .worker_failures import WorkerFailureMonitor, POLICY as FAILURE_POLICY
 
 
 def toml(value):
@@ -55,6 +56,8 @@ def process_clean(execution):
         return False
     group, unit = execution.get('observed_control_group'), execution.get('unit')
     return (execution.get('status') in {'EXITED', 'CANCELLED', 'TIMEOUT_OR_UNKNOWN', 'OUTPUT_LIMIT'}
+            and not execution.get('control_unknown') and not execution.get('fence_callback_error')
+            and not (execution.get('fence_callback_attempted') and execution.get('stop_exit') != 0)
             and isinstance(unit, str) and isinstance(group, str)
             and group.startswith('/user.slice/') and group.endswith('/' + unit)
             and execution.get('remaining_cgroup_pids') == []
@@ -215,7 +218,7 @@ class NativeDevelopmentRunner:
             argv.append(prompt)
         return argv
 
-    def _run(self, argv, folder, prefix, workspace, seconds, stop, fence=lambda: None):
+    def _run(self, argv, folder, prefix, workspace, seconds, stop, fence=lambda: None, *, monitor=None):
         from tools.linux_worker_smoke import run_cgroup
         self._pins()
         if stop.is_set():
@@ -223,9 +226,75 @@ class NativeDevelopmentRunner:
         env = {'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8',
                'HOME': str(self.runtime / 'runtime-home'), 'CODEX_HOME': str(self.runtime / 'runtime-home'),
                'TMPDIR': str(workspace / '.tmp')}
+        callbacks = {'on_output': monitor.feed, 'on_tick': monitor.tick, 'on_eof': monitor.finish,
+                     'control_unknown': lambda: monitor.control_unknown} if monitor else {}
         return run_cgroup(argv, 'codex-development-' + uuid.uuid4().hex + '.service',
                           seconds, workspace, env, folder, prefix,
-                          cancel=stop, before_terminate=fence)
+                          cancel=stop, before_terminate=fence, **callbacks)
+
+    def _monitor_claim(self, claim, folder, local_stop, shared_stop, *, policy=None):
+        queue = self.queue
+        def fatal(reason):
+            # Cancellation cannot wait behind SQLite's normal 10-second busy window.
+            local_stop.set()
+            shared_stop.set()
+            try:
+                fenced = queue.fence(claim, 'worker_failure:' + reason, timeout=.05)
+                with queue.transaction(timeout=.05) as db:
+                    queue._event(db, claim['task']['task_id'], 'worker_failure_stop',
+                                 attempt_id=claim['attempt_id'], claim_epoch=claim['epoch'],
+                                 reason=reason, fenced=fenced)
+            finally:
+                # DB/disk errors cannot strand the process while awaiting evidence.
+                local_stop.set()
+                shared_stop.set()
+        return WorkerFailureMonitor(folder / 'failure-policy',
+            {'queue_id': queue.queue_id, 'task_hash': claim['task_hash'],
+             'attempt_id': claim['attempt_id'], 'epoch': claim['epoch'],
+             'policy_hash': queue.policy['policy_hash']}, claim['task']['budgets']['runtime_seconds'], fatal,
+            policy=policy)
+
+    def _maintain_claim(self, claim, done, monitor, local_stop, shared_stop):
+        renewed = time.monotonic()
+        while not done.wait(.2):
+            try:
+                if shared_stop.is_set():
+                    monitor.stop('CANCELLED')
+                    return
+                self.queue.artifacts.authenticate(claim, {'RUNNING', 'VALIDATING'}, timeout=.05)
+                if time.monotonic() - renewed >= 2:
+                    if not self.queue.heartbeat(claim, lease_seconds=60, timeout=.05):
+                        monitor.stop('LEASE_LOST_OR_FENCED')
+                        return
+                    renewed = time.monotonic()
+                if digest(self.config.read_bytes()) != self.config_hash:
+                    monitor.stop('NATIVE_CONFIG_DRIFT')
+                    return
+            except Exception:
+                try:
+                    monitor.stop('LEASE_OR_CONTROL_UNKNOWN')
+                except Exception:
+                    # monitor already latched control_unknown; cancellation still wins.
+                    pass
+                finally:
+                    local_stop.set()
+                    shared_stop.set()
+                return
+
+    def _handoff_claim(self, claim, done, heartbeat, monitor, local_stop, shared_stop):
+        # Every native process has exited before this publication handoff. Stop the
+        # RUNNING/VALIDATING-only guard before REVIEW becomes the legal state.
+        done.set()
+        heartbeat.join(timeout=3)
+        if heartbeat.is_alive():
+            monitor.stop('WATCHDOG_UNKNOWN')
+            raise ContractError('WATCHDOG_UNKNOWN')
+        if local_stop.is_set() or shared_stop.is_set() or monitor.stopped or monitor.control_unknown:
+            raise ContractError('CANCELLED_OR_CONTROL_UNKNOWN_HANDOFF')
+        self.queue.artifacts.authenticate(claim, {'VALIDATING'})
+        self._pins()
+        if digest(self.config.read_bytes()) != self.config_hash:
+            raise ContractError('NATIVE_CONFIG_DRIFT')
 
     def attempt(self, claim, stop):
         queue = self.queue
@@ -233,11 +302,7 @@ class NativeDevelopmentRunner:
         folder.mkdir(parents=True, exist_ok=False)
         local_stop = threading.Event()
         done = threading.Event()
-        def maintain():
-            while not done.wait(2):
-                if stop.is_set() or not queue.heartbeat(claim, lease_seconds=60):
-                    local_stop.set()
-                    return
+        monitor = None
         execution = None
         processes = []
         try:
@@ -252,28 +317,36 @@ class NativeDevelopmentRunner:
                 if not file.exists():
                     frozen_bytes(file, b'')
             baseline = scan(workspace, ignore_scratch=True)
+            monitor = self._monitor_claim(claim, folder, local_stop, stop)
             settings, _ = self._settings(workspace, claim['task']['allowed_files'], claim['task']['execution'])
             prompt = ('Complete this public synthetic development task using native tools. '
                       'Only edit allowed_files. Do not spawn agents, change tests/instructions/Git, '
                       'or access credentials, controller, other worktrees or network. '
-                      'The controller performs tests and independent review.\n' + canonical(claim['task']))
+                      'The controller performs tests and independent review. '
+                      'Known ordinary tool/test errors may be corrected in this same turn only: '
+                      'at most 3 failed tool events and 60 seconds from the first failure, within task timeout. '
+                      'Never retry safety/permission denials or request a new attempt.\n' + canonical(claim['task']))
             argv = self._argv(workspace, settings, prompt=prompt)
             intent = {'mode': 'DEVELOPMENT', 'queue_id': queue.queue_id, 'claim': claim,
                       'argv': argv, 'config_hash': self.config_hash, 'pins': {str(p): h for p, h in self.pins.items()},
-                      'settings': settings, 'baseline': baseline, 'challenge': uuid.uuid4().hex}
+                      'settings': settings, 'baseline': baseline, 'challenge': uuid.uuid4().hex,
+                      'worker_failure_policy': FAILURE_POLICY}
             frozen_bytes(folder / 'intent.json', canonical(intent).encode())
             if stop.is_set() or not queue.dispatch_intent(claim):
                 raise ContractError('DISPATCH_REPLAY_OR_CANCELLED')
             with self._counter_lock:
                 self.dispatches += 1
-            heartbeat = threading.Thread(target=maintain, daemon=True)
+            heartbeat = threading.Thread(target=self._maintain_claim,
+                args=(claim, done, monitor, local_stop, stop), daemon=True)
             heartbeat.start()
             worker_process = {'role': 'worker', 'execution': None}
             processes.append(worker_process)  # UNKNOWN before launch or a thrown _run.
             execution = self._run(argv, folder, 'worker', workspace,
                                   claim['task']['budgets']['runtime_seconds'], local_stop,
-                                  lambda: queue.fence(claim, 'native_process_stop'))
+                                  lambda: monitor.stop('NATIVE_PROCESS_STOP'), monitor=monitor)
             worker_process['execution'] = execution
+            if monitor.finish()['stopped']:
+                raise ContractError('WORKER_FAILURE_POLICY_STOP:' + monitor.reason)
             raw = (folder / 'worker.jsonl').read_bytes()
             completed = native_success(execution, raw)
             tools = tool_evidence(raw)
@@ -289,6 +362,7 @@ class NativeDevelopmentRunner:
             validation = self.validate(claim, workspace, folder, local_stop, processes=processes)
             if scan(workspace, ignore_scratch=True) != before_validation:
                 raise ContractError('VALIDATOR_CHANGED_WORKSPACE')
+            self._handoff_claim(claim, done, heartbeat, monitor, local_stop, stop)
             receipt.update({'validator_evidence': validation, 'snapshot_hash': snapshot['snapshot_hash'],
                             'process_tree_empty': True, 'process_boundary': 'CGROUP_LIFECYCLE_ONLY',
                             'evidence_kind': 'REAL_NATIVE_CLI_DEVELOPMENT',
@@ -300,7 +374,8 @@ class NativeDevelopmentRunner:
                             'execution_hash': digest(raw), 'intent_hash': fingerprint(intent),
                             'execution_receipt_hash': fingerprint(execution),
                             'process_evidence_hash': fingerprint(processes),
-                            'scratch_evidence': {k: v for k, v in scan(workspace).items() if k.startswith('.tmp/')}})
+                            'scratch_evidence': {k: v for k, v in scan(workspace).items() if k.startswith('.tmp/')},
+                            'worker_failure_evidence': monitor.summary()})
             receipt['artifact_manifest_hash'] = queue.artifacts.publish(claim, workspace, receipt['artifacts'])
             frozen_bytes(folder / 'receipt.json', canonical(receipt).encode())
             if not queue.finish(claim, receipt, True):
@@ -308,12 +383,25 @@ class NativeDevelopmentRunner:
             return {'status': 'REVIEW', 'task_id': claim['task']['task_id'], 'attempt_id': claim['attempt_id'],
                     'receipt_hash': fingerprint(receipt), 'native_worker': True, 'merge_executed': False}
         except Exception as error:
-            queue.fence(claim, 'development_failure_no_retry')
-            if attempt_cleanup_known(processes):
+            if monitor is not None:
+                try:
+                    monitor.stop('ATTEMPT_FAILED')
+                except Exception:
+                    local_stop.set()
+                    stop.set()
+            fence_error = None
+            try:
+                queue.fence(claim, 'development_failure_no_retry', timeout=.05)
+            except Exception as fence_failure:
+                fence_error = type(fence_failure).__name__
+            cleanup_known = (fence_error is None and not (monitor and monitor.control_unknown)
+                             and attempt_cleanup_known(processes))
+            if cleanup_known:
                 queue.cleanup(claim, tree_empty=True, retry=False, provider_completion_unknown=True)
             report = {'status': 'BLOCKED', 'reason': str(error), 'attempt_id': claim['attempt_id'],
                       'no_retry': True, 'execution': execution, 'processes': processes,
-                      'cleanup_known': attempt_cleanup_known(processes)}
+                      'cleanup_known': cleanup_known, 'fence_error': fence_error,
+                      'worker_failure_evidence': monitor.summary() if monitor else None}
             if 'workspace' in locals():
                 try:
                     report['workspace_hashes'] = scan(workspace)

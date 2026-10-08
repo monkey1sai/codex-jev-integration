@@ -93,3 +93,62 @@ Campaign 整體仍為 **PARTIAL**：乘法 Worker 有一筆 `python` exit 127，
 3 Worker＋3 Task Review 額度已用完，不重試；raw FAIL 與 Controller PASSED 均保留。
 完整證據、預算、限制與下一輪停止政策要求見
 [Phase 1–2 ADR](orchestrator-phase1-2.md) 的新 Campaign 記錄。
+
+## Worker Failure Policy v1（新的 Development Attempts）
+
+2026-10-08 在 `6c52ca6` 後增量實作。只對新的 attempts 使用，不重新解釋
+上述 Campaign PARTIAL，也不重開歷史 queue 或補發 dispatch intent。
+沿用 `NativeDevelopmentRunner`、`run_cgroup`、SQLite lease/fencing 與既有 Supervisor。
+政策來源是受信任 Controller source，並納入 compiled policy hash；task 或 Worker
+不能自行宣告某個錯誤可恢復。
+
+| Failure | 判定來源 | 同 turn 修正 | Controller 動作 |
+|---|---|---|---|
+| 普通工具／測試錯誤 | CLI `command_execution/failed`、exit 1/2/127，加固定普通診斷訊號 | 允許，受下述上限限制 | 保存 raw event、hash chain、失敗次數及固定 deadline |
+| 權限／Sandbox／Approval 拒絕、唯讀路徑、取消、timeout、lease／fencing 訊號 | 可信 CLI envelope 與 Controller watchdog；拒絕訊號優先 | 不允許 | latch STOP、durable fence、取消共享執行、停止 owned cgroup |
+| lease 失效、Controller/policy/config 漂移、watchdog 或 evidence 寫入失敗 | Controller 的 Queue、compiled source、runtime config 及 callback | 不允許 | STOP；無法證明控制／清理完整時 HELD，保留 locks/slot |
+| Provider UNKNOWN、turn failed、缺 completion、格式不明、未知工具、replay | 增量 CLI JSONL parser／EOF | 不允許 | fail-closed；新 dispatch retry 為 0 |
+| 超出次數／恢復時間／task runtime／output cap | Controller 的 monotonic clock 與計數器 | 不允許 | STOP；不可透過成功事件或重啟重置 |
+| 取消指令非零、callback UNKNOWN、殘留程序或未關閉 output readers | 實際 systemd/cgroup lifecycle receipt | 不允許 | `CONTROL_UNKNOWN`／`CLEANUP_UNVERIFIED`，不得接納產物或釋放未知容量 |
+| Validator、artifact、必要 Review 失敗 | 既有 Controller acceptance/review chain | 不適用此 Worker 修正額度 | 保留既有 STOP／NO_RETRY／Review Gate |
+
+固定普通診斷清單包含 `command not found`、常見 Python/JavaScript exception、
+unittest/pytest failure 及 TS/CS compiler error。exit code 本身不授予修正資格。
+未識別的 build/tool 錯誤停止；stdout 包含拒絕訊號即使 exit 0 也保守停止。
+清單不是對任意工具輸出的完備語意分類，可能發生保守誤停。
+
+**預算：最多 3 筆不同 completed tool 的可恢復失敗；第 4 筆立即停止。**
+首次失敗後同一 turn 必須在 60 秒內完成，亦受較短的 task runtime 限制。
+成功工具不重置計數或時間，沒有新的 attempt、模型 turn 或 dispatch retry。
+可信 Controller 可收緊此政策；不可透過 task input 擴大上限。
+
+stdout 使用 `read1()` 增量讀取並保存原始 JSONL；逐筆檢查 deadline，fatal 不會
+被稍後 completion 清除。guard 每 0.2 秒檢查 claim/config，heartbeat 仍每 2 秒更新。
+持久化及 stop callback 失敗的 `control_unknown` 會傳至 lifecycle receipt 與最終
+cleanup 判定，不因 DB 後來恢復而變成已驗證。成功發布前停止並 join watchdog，
+再檢查 VALIDATING、runtime pins/config，避免正常 REVIEW 被當成 lease 失效。
+
+fatal 先送 local/shared 取消訊號，再嘗試持久 fence。watchdog 的 claim/heartbeat
+查詢與停止路徑的 fence/event 寫入，各採 50ms SQLite busy wait；一般 Queue 的
+10 秒預設不變。DB 持續不可用時不能宣稱即時寫成 HELD；保留控制 UNKNOWN、
+既有 task/locks/slot，待 DB 恢復才核實 ledger。50ms 是單次 DB 等待，非總停止 SLA。
+
+每次 attempt 有獨立 `failure-policy/policy.json`、逐筆 hash-chain records、raw events、
+execution/failure receipt。重啟只讀核對，不重新建立 monitor 或補回執行額度。
+這些是 Controller 保管的證據，不是 provider 簽章。
+
+### 本輪零 Provider 驗證與限制
+
+`tools/worker_failure_probe.py` 使用固定 Python event emitter、既有 Native runner 的
+控制 callback/watchdog 與真實 systemd cgroup；**沒有啟動 Codex CLI、模型或 Jev**。
+scope 是 `SYNTHETIC_EVENT_CONTROLLER_AND_CGROUP_ONLY`，不宣稱 native sandbox 等價。
+
+最終 run `worker-failure-policy-final-20261008-aa10fc53`：14 案例全部符合預期；
+284 項完整 regression 通過，fresh Controller audit 與 155 檔 custody 核對通過。
+實際結果與完整命令見 ADR，公開 logs/evidence 留在 ignored `runs/`，不提交 runtime journal。
+
+停止是**觀測事件後的取消**，不是 atomic pre-tool gate；不能保證 CLI 在 Controller
+看見 fatal 前沒有開始下一個工具。固定 emitter 的觀測／清理延遲不是普遍 SLA。
+restart case 是執行期間重開 Controller 並注入 lease expiry；強制殺死 Controller 的
+hard crash recovery 未測。kernel `RuntimeMaxSec` 保留，但不冒稱 crash 時即時停止。
+新 failure policy 在真實模型上的驗收本輪 NOT_RUN，需要新的有界授權。

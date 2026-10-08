@@ -54,11 +54,14 @@ class Store:
                 raise ContractError("QUEUE_POLICY_DRIFT")
 
     @contextmanager
-    def transaction(self):
-        db = sqlite3.connect(self.path, timeout=10, isolation_level=None)
+    def transaction(self, *, timeout=10):
+        # Trusted stop paths may tighten waiting; ordinary queue defaults stay unchanged.
+        if type(timeout) not in (int, float) or not .01 <= timeout <= 10:
+            raise ContractError('TRANSACTION_TIMEOUT_BOUND')
+        db = sqlite3.connect(self.path, timeout=timeout, isolation_level=None)
         db.row_factory = sqlite3.Row
         try:
-            db.execute("PRAGMA busy_timeout=10000")
+            db.execute("PRAGMA busy_timeout=" + str(int(timeout * 1000)))
             db.execute("BEGIN IMMEDIATE")
             yield db
             db.commit()

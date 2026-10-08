@@ -985,3 +985,141 @@ stop policy 的 failure 層級；若仍要求任何工具 FAIL 即停，須在�
 reader 接入即時取消/fencing，不能用事後 audit 代替。也可在新的、明確授權契約
 允許同 turn 的無害工具環境修正；這不會追溯更改本輪偏差。
 任何新真實驗證需要新的 bounded envelope。沒有 Global 變更、push、PR 或 merge。
+
+## 2026-10-08 Worker Failure Policy 與即時停止（零 Provider）
+
+基準 `6c52ca6fa1dac3ea2c8b7b0cd341cb6b5d796b69`。使用者授權只涵蓋新的
+Failure Policy、零 Provider 故障注入、完整回歸及本地 checkpoint。
+沒有啟動新的 Worker Campaign、Codex inference 或 Jev，沒有修改 Global runtime、
+原生 Sandbox/Approval、active children ceiling、Review 或人工 Merge 要求。
+前節 Campaign **PARTIAL**、歷史 FAIL/UNKNOWN/PASSED 及已消耗額度保持不變。
+
+### 最小增量
+
+- `orchestrator/worker_failures.py`：固定分類、3 筆可恢復失敗／首次失敗 60 秒／
+  task runtime 上限、incremental JSONL、fatal/control-unknown latch、immutable hash chain。
+- `orchestrator/development.py`：Worker stdout/tick/EOF 接入 monitor；即時 fence/cancel；
+  claim/config watchdog；成功轉 REVIEW 前的 watchdog handoff；未知清理不釋放 locks。
+- `tools/linux_worker_smoke.py`：沿用既有 systemd cgroup，改增量 read1、callback drain、
+  fence-before-stop、cancel/control failure 記錄；停止指令非零保持 cleanup unverified。
+- `orchestrator/policy.py`：新增 Failure Policy source hash，禁止默默換執行規則。
+- `orchestrator/store.py`、`phase2.py`、`evidence.py`：既有 transaction/fence/heartbeat/
+  authenticate 介面只增加可信 timeout keyword，預設不變；native stop/watchdog 用 50ms。
+- `tools/worker_failure_probe.py` 與 tests：固定零 Provider emitter／受控故障注入；
+  原 Development test 只補 monitor 接線，不用 mock 冒稱 native Worker PASS。
+
+完整 Failure Matrix 與邊界位於 `docs/development-execution-mode.md` 的 v1 政策。
+沒有重寫 Queue、Scheduler、Runner 或新增隔離框架。
+
+### 實際停止、fencing 與重啟證據
+
+初版 run `worker-failure-policy-20261008-6c704033` 的 9 案例符合當時斷言。
+獨立審查另找出 watchdog-origin UNKNOWN、publication/guard 競態與同 chunk deadline
+三個缺口。先新增定向 regression，實跑 21 項呈現 1 FAIL／4 ERROR，之後修正。
+初版證據不刪除，不將初版九案冒稱 final source 的完整驗收。
+
+中間 12／13 案例版本各保留獨立 evidence。提交前另以真實 SQLite 鎖重現 fatal
+callback 與 watchdog 查詢被原 10 秒 busy wait 阻擋；兩個定向測試各先 FAIL，
+修正後 PASS。fatal 先發取消訊號，受信任停止／watchdog 路徑用 50ms 單次 DB 等待，
+一般 Queue 預設不變。DB 故障期間不假稱 durable fence 已成功或 ledger 已變 HELD；
+停止執行、保留 locks/slot 及 UNKNOWN，DB 恢復後才核對並 fence，不接納結果。
+
+最終 run **`worker-failure-policy-final-20261008-aa10fc53`**，14 個新的固定 fault fixtures，
+逐一啟動、各 2 秒 lifecycle budget；每個 SQLite fixture 僅一筆 synthetic dispatch intent。
+這些不是 Codex Worker dispatch；**Provider turns=0、Jev calls=0、重試=0**。
+
+| Fault injection | 實際結果 |
+|---|---|
+| 普通 command-not-found | 保留 exit 127，原 emitter turn 修正並完成；monitor 未停止；不是模型驗收 |
+| permission denial | turn 結束前 fence/cancel，late main/child marker 均未產生 |
+| 第四筆可恢復失敗 | `RECOVERY_COUNT_EXHAUSTED`，沒有重置次數 |
+| 恢復時間用完 | 使用更嚴 0.25 秒測試上限；`RECOVERY_TIME_EXHAUSTED` |
+| cancel、task timeout | 即時 STOP、durable fence 在 cgroup stop request 之前 |
+| lease invalidation | watchdog 停止；舊 epoch/result/intent 被拒絕 |
+| missing provider completion | exit 0 仍 STOP；本案 stop 命令回報 unit 已消失、非零，保守 HELD |
+| stdout callback fence exception | `control_unknown=true`；HELD、locks 保留，cleanup 不宣稱 verified |
+| watchdog callback fence exception | DB 回復後仍 `control_unknown=true`；HELD、locks 保留 |
+| cancellation result unknown | 真的停止 owned unit後注入非零控制回覆；`CLEANUP_UNVERIFIED`、HELD |
+| Controller reopen during execution | fresh Queue 重開並注入 lease-expiry clock；STOP；拒絕 stale intent/result |
+| 真實 SQLite 鎖：stdout-origin | 關閉此 case 的 watchdog，分離原因；fault callback 有界結束，CONTROL_UNKNOWN／HELD |
+| 真實 SQLite 鎖：watchdog-origin | guard 查詢短等待後 STOP；沒有等待正常 10 秒上限，CONTROL_UNKNOWN／HELD |
+
+正常 fatal 案例均核對 fence/stop 順序、實際 owned cgroup 空、output readers 關閉，
+沒有 late markers。UNKNOWN 案例即使 cgroup 已空，也不將 `process_cleanup_verified`
+設為 true。fixture 最後不製造 Task PASSED；只保存 CANCELLED／HELD。
+
+permission case 從公開 stimulus 到 Controller STOP record 為 **4.493ms**；正常取消
+及 fatal 案例從 stop request 至 lifecycle receipt 完成約 **7.111–7.874ms**。
+這是固定本地 emitter 的量測，不是 native Worker SLA，也不是 atomic pre-tool gate。
+`fence_callback_started_unix` 表示停止 callback 開始；`stop_requested_unix` 在 callback
+返回後記錄，表示隨後的 cgroup stop request，不混稱為取消 flag 最早送達時間。
+第 4 次失敗的 observation 數字從第 1 次 fault 起算，不將它誤報為第四次取消延遲。
+
+fresh 零 Provider 程序重開全部 14 Queue，核對 policy/source pins、failure hash chain、
+ledger/budget 未變、stale result/dispatch 拒絕；全部 systemd unit inactive、MainPID=0。
+公開 evidence 在 `runs/worker-failure-policy-final-20261008-aa10fc53/`：
+
+- `launch-plan.json`：執行前 scope、零 Provider 預算與 source hashes。
+- `result.json`、逐案 `result.json`／`controller/execution/`：原始合成 events、真實 cgroup
+  argv/receipt、failure records、SQLite backup、公開 canary／程序資料。
+- `restart-audit.json`：fresh Controller 核對、current unit 狀態與 source hashes。
+- `custody.json`：155 檔 SHA-256；manifest SHA-256
+  `11d448373ff523753b6afafbb8ee18a45e859d401fd3ebec5c3ed10e9ff530b2`。
+- `verification-results.json`、三份 regression logs／`verification-custody.json`：完整測試命令、
+  實際結果、初版/歷史 hashes與獨立 advisory review 摘要。
+
+Windows 上再次逐檔重算 final 155、初版 103、歷史 Campaign 79、歷史 Development
+56 hashes，全部一致。沒有重新開啟或改寫歷史 queue，也沒有改判歷史 Campaign。
+source 改變時舊 policy-bound queue 應拒絕當新執行 queue 使用，audit 不授權遷移或 replay。
+
+### 實跑命令與 Regression
+
+```powershell
+# WSL：固定 emitter only，不啟動 CLI/model/Jev。
+wsl.exe -d Ubuntu-24.04 --exec /usr/bin/python3 -I -B /mnt/c/.llmcode/codex-orchestrator-phase1-2/tools/worker_failure_probe.py --runtime /home/ssss/codex-orchestrator-smoke-20261008 --run-root /home/ssss/codex-orchestrator-smoke-20261008/worker-failure-policy-final-20261008-aa10fc53
+
+# repo root；PYTHONDONTWRITEBYTECODE=1
+python -B -m unittest discover -s orchestrator_tests -v
+python -B -m unittest test_response_diagnostics test_decision test_phase2a test_resources test_combined test_inventory_safety
+# payload/jev
+python -B -m unittest test_inventory
+```
+
+probe 的 run-root 必須全新，已使用路徑拒絕重開。以上是已跑命令，不是再次啟動授權。
+三個 regression commands 均 exit 0、OK、沒有 skipped：
+
+| Suite | 結果 |
+|---|---|
+| Orchestrator | **195 PASS**，41.556s；原 171 保留，加 24 Failure Policy tests |
+| Jev regression | **77 PASS**，3.800s；零 Jev provider |
+| Inventory | **12 PASS**，0.021s |
+| 合計 | **284 PASS**；原 260 保留 |
+
+獨立唯讀 architecture review 複查前述 P1/P2 全部解除，recommendation=accept，
+沒有新的 blocking finding。這個 review 僅對本輪 Controller/lifecycle 改動 advisory，
+不偽造 Task Reviewer receipt 或 provider provenance。
+
+### 狀態、未測邊界與 M3 最小方案
+
+**DONE（限本輪範圍）**：Failure Policy、bounded same-turn recovery、串流 fatal stop、
+durable fencing、UNKNOWN fail-closed、零 Provider 真實程序清理、fresh recovery audit、
+全部 regression及獨立改動審查。
+
+**NOT_RUN**：新政策的真實 Codex Worker Campaign、強制殺死 Controller 的 hard crash
+recovery、真實模型工具拒絕的取消延遲。事件仍是觀測後取消，不能保證事件傳到
+Controller 前未開始下一個工具。分類清單可能保守誤停，未知錯誤仍停止。
+kernel RuntimeMaxSec 是保留的 crash 時間上限，不是 immediate crash cleanup 證明。
+
+**PARTIAL**：歷史 Campaign、整個 Agent Factory/Phase 1–2 仍不能無保留宣稱完成。
+原 High-Assurance Production Admission 繼續 BLOCKED／可選；本輪不投入該路線。
+
+下一次遊戲 Repo 實戰的最小前置工作是指定一個授權 Repo/基準及單一任務，盤點
+該 Repo 的 AGENTS/OpenSpec、Build/Test與既有能力，再讓現有 Worktree Allocator/
+Development runner 支援該明確 Repo 的最小 scope 與 pinned validators。
+目前 runner 仍限定 synthetic fixture／artifact directory，不能直接冒稱任意遊戲 Repo 可用。
+不重寫 Scheduler，不安裝 Global runtime，不直接修改 main。
+
+完成零 Provider 前置檢查後才另取得 **1 Worker＋1獨立Review、零新attempt retry** 的
+明確新 envelope，驗證 Task→真實修改→Repo Build/Test→Artifact→Review→PASSED。
+只有單 Worker 新政策驗收完整通過才提出雙 Worker 方案；不沿用歷史已用額度，Merge 仍須
+人工授權。本輪到本地 checkpoint 停止；沒有 background Worker 或 remote mutation。

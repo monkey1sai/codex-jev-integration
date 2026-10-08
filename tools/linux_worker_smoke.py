@@ -173,7 +173,8 @@ def check_add_artifact(data):
         raise ValueError('PURE_ADD_EXPRESSION_REQUIRED')
 
 
-def run_cgroup(command, unit, seconds, repo, env, evidence, prefix, *, cancel=None, before_terminate=None):
+def run_cgroup(command, unit, seconds, repo, env, evidence, prefix, *, cancel=None, before_terminate=None,
+               on_output=None, on_tick=None, on_eof=None, control_unknown=None):
     """Own descendants independently of launcher lifetime; cap each output stream."""
     control_env = {**env, 'XDG_RUNTIME_DIR': '/run/user/'+str(os.getuid())}
     argv = ['/usr/bin/systemd-run', '--user', '--unit='+unit, '--pipe', '--wait', '--collect',
@@ -184,36 +185,66 @@ def run_cgroup(command, unit, seconds, repo, env, evidence, prefix, *, cancel=No
             '/usr/bin/env', '-i', *[k+'='+v for k, v in env.items()], *command]
     record = {'argv': argv, 'unit': unit, 'status': 'STARTING', 'started_unix': time.time()}
     exceeded = threading.Event()
+    control_failed = threading.Event()
+    fence_lock = threading.Lock()
     handles = []
     process = None
-    def pump(stream, path):
+    def fence_before_stop():
+        with fence_lock:
+            if record.get('fence_callback_attempted'):
+                return
+            record['fence_callback_attempted'] = True
+            record['fence_callback_started_unix'] = time.time()
+            if before_terminate is not None:
+                try:
+                    before_terminate()
+                    record['fence_callback_completed_unix'] = time.time()
+                except Exception as exc:
+                    record['fence_callback_error'] = type(exc).__name__
+                    control_failed.set()
+            record['stop_requested_unix'] = time.time()
+    def pump(stream, path, monitored):
         total = 0
         try:
             with path.open('xb') as out:
-                while data := stream.read(4096):
+                # Buffered read() can wait for 4096 bytes/EOF and miss live fatal events.
+                while data := stream.read1(4096):
                     total += len(data)
                     if total > 262144:
                         exceeded.set()
+                        fence_before_stop()
                         break
                     out.write(data)
-        except Exception:
-            exceeded.set()
+                    if monitored and on_output is not None:
+                        out.flush()
+                        os.fsync(out.fileno())
+                        on_output(data)
+                if monitored and on_eof is not None:
+                    on_eof()
+        except Exception as exc:
+            record['output_callback_error'] = type(exc).__name__
+            control_failed.set()
+            fence_before_stop()
     try:
         process = subprocess.Popen(argv, cwd=repo, env=control_env,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         record['controller_pid'] = process.pid
         write_new(evidence/(prefix+'-started.json'), record)
         for stream, suffix in ((process.stdout, '.jsonl'), (process.stderr, '.log')):
-            handle = threading.Thread(target=pump, args=(stream, evidence/(prefix+suffix)), daemon=True)
+            handle = threading.Thread(target=pump, args=(stream, evidence/(prefix+suffix), suffix == '.jsonl'), daemon=True)
             handle.start(); handles.append(handle)
         deadline = time.monotonic()+seconds+5
         record['unit_details'] = ''
-        while (process.poll() is None and not exceeded.is_set() and time.monotonic() < deadline
+        while (process.poll() is None and not exceeded.is_set() and not control_failed.is_set() and time.monotonic() < deadline
                and not (cancel is not None and cancel.is_set())):
+            if on_tick is not None:
+                on_tick()
+            if cancel is not None and cancel.is_set():
+                break
             if not record['unit_details']:
                 details = subprocess.run(['/usr/bin/systemctl', '--user', 'show', unit,
                                           '--property=MainPID,ControlGroup,KillMode,RuntimeMaxUSec,MemoryMax,MemorySwapMax,TasksMax'],
-                                         env=control_env, capture_output=True, text=True, timeout=5)
+                                         env=control_env, capture_output=True, text=True, timeout=.5 if on_tick else 5)
                 if details.returncode == 0 and 'MainPID=0\n' not in details.stdout:
                     record['unit_details'] = details.stdout
                     record['main_pid_observed_unix'] = time.time()
@@ -225,11 +256,12 @@ def run_cgroup(command, unit, seconds, repo, env, evidence, prefix, *, cancel=No
                                                            for name in ('memory.max', 'memory.swap.max', 'pids.max')}
             time.sleep(.05)
         record['output_limit_exceeded'] = exceeded.is_set()
-        if process.poll() is None:
+        if (process.poll() is None or control_failed.is_set()
+                or cancel is not None and cancel.is_set()):
             record['status'] = ('CANCELLED' if cancel is not None and cancel.is_set() else
+                                'CONTROL_UNKNOWN' if control_failed.is_set() else
                                 'OUTPUT_LIMIT' if exceeded.is_set() else 'TIMEOUT_OR_UNKNOWN')
-            if before_terminate is not None:
-                before_terminate()
+            fence_before_stop()
         else:
             record['exit_code'] = process.returncode
             record['launcher_exited_unix'] = time.time()
@@ -237,11 +269,24 @@ def run_cgroup(command, unit, seconds, repo, env, evidence, prefix, *, cancel=No
     except Exception as exc:
         record['error'] = type(exc).__name__+':'+str(exc)
         record['status'] = 'EXECUTION_UNKNOWN'
+        fence_before_stop()
     finally:
+        # A vanished launcher does not prove descendants stopped. Fence before
+        # terminating a still-populated owned cgroup, including callback failures.
+        expected = '/user.slice/user-'+str(os.getuid())+'.slice/user@'+str(os.getuid())+'.service/app.slice/'+unit
+        try:
+            group = Path('/sys/fs/cgroup'+expected)
+            if group.exists() and any(p.read_text().strip() for p in group.rglob('cgroup.procs')):
+                fence_before_stop()
+        except OSError:
+            control_failed.set()
+            fence_before_stop()
         try:
             stop = subprocess.run(['/usr/bin/systemctl', '--user', 'stop', unit], env=control_env,
                                   capture_output=True, timeout=10)
             record['stop_exit'] = stop.returncode
+            if record.get('fence_callback_attempted') and stop.returncode != 0:
+                record['status'] = 'CLEANUP_UNVERIFIED'
         except (OSError, subprocess.TimeoutExpired) as exc:
             record['stop_exit'] = None
             record['stop_error'] = type(exc).__name__
@@ -249,6 +294,15 @@ def run_cgroup(command, unit, seconds, repo, env, evidence, prefix, *, cancel=No
         if process is not None and process.poll() is None:
             process.kill(); process.wait(timeout=5)
         for handle in handles: handle.join(timeout=5)
+        # Drain the final callback before interpreting an apparent exit 0.
+        try:
+            record['control_unknown'] = control_failed.is_set() or bool(control_unknown and control_unknown())
+        except Exception:
+            record['control_unknown'] = True
+        if (record['control_unknown'] or record.get('fence_callback_error')):
+            record['status'] = 'CONTROL_UNKNOWN'
+        elif cancel is not None and cancel.is_set() and record['status'] == 'EXITED':
+            record['status'] = 'CANCELLED'
         record['output_limit_exceeded'] = exceeded.is_set()
         record['output_readers_closed'] = all(not h.is_alive() for h in handles)
         expected = '/user.slice/user-'+str(os.getuid())+'.slice/user@'+str(os.getuid())+'.service/app.slice/'+unit

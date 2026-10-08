@@ -102,11 +102,11 @@ class ArtifactStore:
         with queue.transaction() as db:
             db.execute('CREATE TABLE IF NOT EXISTS artifact_manifests(task TEXT PRIMARY KEY, attempt TEXT, epoch INTEGER, hash TEXT, manifest TEXT)')
 
-    def authenticate(self, claim, states):
+    def authenticate(self, claim, states, *, timeout=10):
         self.queue._fresh()
         if not isinstance(claim.get('attempt_id'), str) or not re.fullmatch('[a-f0-9]{32}', claim['attempt_id']):
             raise ContractError('INVALID_ATTEMPT_ID')
-        with self.queue.transaction() as db:
+        with self.queue.transaction(timeout=timeout) as db:
             if not self.queue._current(db, claim, states, time.time()):
                 raise ContractError('STALE_ARTIFACT_PUBLICATION')
 

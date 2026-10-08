@@ -151,18 +151,22 @@ class DevelopmentContracts(Fixture):
                 workspace.mkdir(parents=True)
                 runner = NativeDevelopmentRunner.__new__(NativeDevelopmentRunner)
                 runner.queue, runner.root, runner.repo = queue, self.root, self.repo
-                runner.config_hash, runner.pins, runner.dispatches = 'pin', {}, 0
+                from orchestrator.evidence import digest
+                runner.config = workspace / 'native-config-fixture'
+                runner.config.write_bytes(b'public test config')
+                runner.config_hash, runner.pins, runner.dispatches = digest(runner.config.read_bytes()), {}, 0
                 runner._counter_lock = threading.Lock()
                 runner.artifact_guard, runner.expected_stdout = None, {}
                 plan = {'commands': [{'validator': 'unit', 'files': {}, 'argv': ['fixture-only'], 'timeout_seconds': 1}]}
                 runner.validators = Mock()
                 runner.validators.plan.return_value = plan
-                def launch(argv, folder, prefix, *args):
+                def launch(argv, folder, prefix, *args, **kwargs):
                     if prefix == 'worker':
                         raw = b'{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000000000001"}\n'
-                        raw += b'{"type":"item.completed","item":{"type":"file_change","status":"completed"}}\n'
+                        raw += b'{"type":"item.completed","item":{"id":"fixture-tool","type":"file_change","status":"completed"}}\n'
                         raw += b'{"type":"turn.completed"}\n'
                         (folder / 'worker.jsonl').write_bytes(raw)
+                        kwargs['monitor'].feed(raw)
                     return {**clean_process(), 'status': 'CLEANUP_UNVERIFIED' if prefix == failed_role or (prefix == 'unit' and failed_role == 'validator') else 'EXITED'}
                 with patch('orchestrator.development.allocate', return_value=(workspace, self.root)), \
                      patch('orchestrator.development.materialize', return_value={'snapshot_hash': 'fixture'}), \

@@ -136,12 +136,12 @@ class Phase2Queue(CoreQueue):
     def validating(self, claim, now=None):
         return self._transition(claim, {'RUNNING'}, 'VALIDATING', now)
 
-    def heartbeat(self, claim, lease_seconds=180, now=None):
+    def heartbeat(self, claim, lease_seconds=180, now=None, *, timeout=10):
         self._fresh()
         if type(lease_seconds) not in (int, float) or not 0 < lease_seconds <= 600:
             raise ContractError('LEASE_BOUND')
         now = time.time() if now is None else now
-        with self.transaction() as db:
+        with self.transaction(timeout=timeout) as db:
             if not self._current(db, claim, {'CLAIMED', 'RUNNING', 'VALIDATING'}, now):
                 return False
             key = claim['task']['task_id']
@@ -172,8 +172,8 @@ class Phase2Queue(CoreQueue):
                            (key, fingerprint(receipt), 'HELD', 'TRUSTED_REVIEW_IMPORT_NOT_IMPLEMENTED'))
             return True
 
-    def fence(self, claim, reason='cancelled'):
-        with self.transaction() as db:
+    def fence(self, claim, reason='cancelled', *, timeout=10):
+        with self.transaction(timeout=timeout) as db:
             key = claim['task']['task_id']
             row = db.execute('SELECT * FROM tasks WHERE id=?', (key,)).fetchone()
             if not self._identity(row, claim) or row['state'] not in {'CLAIMED', 'RUNNING', 'VALIDATING'}:
