@@ -1,5 +1,15 @@
 # Native sandbox diagnostic — 2026-10-08
 
+Latest continuation: the existing Windows failure was not retried. A separately
+installed official Linux CLI/bwrap now executes real restricted commands in
+WSL2. This does not repair or certify Windows native sandbox. The admission
+matrix and retained compatibility/lifecycle failures are recorded in
+[the ADR](orchestrator-phase1-2.md#isolated-linux-admission-continuation--2026-10-08).
+The isolated model worker is still NOT_RUN at the pre-execution checkpoint;
+official login status and readiness now succeed. No mock
+result has been substituted. Production reviewer/provider provenance remains
+BLOCKED independently of Linux command-isolation evidence.
+
 Status: **BLOCKED / ENVIRONMENT_FAILURE**. No native worker PASS is claimed.
 
 ## Checkpoint afe963a evidence, before external recovery

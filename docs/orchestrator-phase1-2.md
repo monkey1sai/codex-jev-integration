@@ -224,6 +224,98 @@ are still not met; there is no pending request to enable routing or benchmark.
 
 ## Remaining acceptance and blockers
 
+### Isolated Linux admission continuation — 2026-10-08
+
+The Windows failure was not retried. Current App is 26.930.7945.0, bundled
+CLI 0.160.1, npm CLI 0.161.0. Existing Ubuntu 24.04.4 on WSL2 2.6.3.0 is
+available; kernel 6.6.87.2-microsoft-standard-WSL2. Its default user has sudo
+and docker memberships and its Windows drive is writable, so WSL alone is
+not the boundary. The test repo and runtime are on its ext4 filesystem.
+
+Official rust-v0.161.0 Linux musl CLI and its separately published bwrap were
+installed only into a newly owned isolated test directory, with release API
+SHA-256 digests checked. No production install/config or system ACL changed.
+The binary-only asset lacks bwrap. Minimal-read also needs the nonstandard
+isolated runtime bin directory explicitly readable. These two compatibility
+fixes produced actual native command execution, without root-read grants.
+
+An attempted file-only writable rule failed before execution with bwrap
+ENOTDIR (synthetic `.git`/`.aws` descendants under the filename). The final
+fixture uses a dedicated artifact directory instead; repo/tests/Git are
+read-only, only artifact and private scratch directories writable. Its new
+CODEX_HOME uses `never` to reject scope expansion and unsandboxed retries;
+`approvals_reviewer=auto_review` remains configured. This stricter one-shot
+setting is not a Global policy change and does not claim an approval occurred.
+Fresh ephemeral exec has no resume/fork/sticky grants, ignores exec rules,
+and disables children, permission requests, hooks, plugins, MCP/apps,
+remote tools and the CLI's automatically seeded builtin skills.
+
+| Admission item | App bundled Windows | npm Windows | Isolated Linux candidate |
+|---|---|---|---|
+| CLI version starts | VERIFIED 0.160.1 | VERIFIED 0.161.0 | VERIFIED 0.161.0 |
+| Configured worker model/effort | UNKNOWN for a live worker | UNKNOWN for a live worker | VERIFIED config: Sol/medium; provider-observed identity UNKNOWN |
+| Native isolation | UNKNOWN; version-matched check rejects this policy | BLOCKED by retained root-read error | Native namespaces/seccomp VERIFIED for canaries |
+| Scoped read/write | UNKNOWN | UNKNOWN | Legal reads/private writes succeed; controller/other-worktree/home canaries hidden |
+| Git/runtime protection | UNKNOWN | UNKNOWN | `.git` and runtime bin writes EROFS |
+| Credentials/secrets | UNKNOWN | UNKNOWN | Actual isolated-home fake secret and fixture `.env` denied; official login status exit 0 |
+| Windows/privileged host channels | UNKNOWN | UNKNOWN | `/mnt/c`, `/init`, binfmt unavailable; `/run/WSL` empty; AF_UNIX/TCP EPERM |
+| Cancel, timeout, controller interruption | UNKNOWN | UNKNOWN | VERIFIED native fork/setsid cleanup with user cgroup |
+| Failure and fresh process restart | UNKNOWN | UNKNOWN | Native exit 7 retained; subsequent command succeeds |
+| Artifact custody | UNKNOWN | UNKNOWN | Bounded scan/pins implemented; real model artifact NOT_RUN |
+| Real model worker | NOT_RUN | NOT_RUN | READY; real model NOT_RUN at this pre-execution checkpoint |
+
+The original process-group-only cancellation left native sandbox descendants.
+They later exited naturally; this is retained as FAIL, not retroactive PASS.
+Existing systemd user transient cgroups supply KillMode=control-group and an
+independent deadline. Actual cancellation/timeout/controller-interruption
+tests include detached descendants and verified empty namespaces afterwards.
+Cgroups manage lifecycle; official bubblewrap/seccomp still enforce isolation.
+No daemon, persistent scheduler or capacity increase was installed.
+
+`tools/linux_worker_smoke.py` is a single authorized synthetic smoke, separate
+from the production queue. It validates pinned binaries/config/acceptance,
+semantic canary results, current cgroup receipts and official login status.
+An exclusive root-owned controller intent prevents repeat model execution.
+Bounded logs and file scans protect the controller; actual ControlGroup must
+match the observed unit. A static AST gate limits this tiny add-function
+contract before execution; native validation makes artifact read-only and
+requires unchanged bytes/tree before custody. It is not a generic Python
+validator. No caller metadata, CLI exit or stdout marker grants production
+PASS or counted independent review.
+
+Readiness / explicitly authorized execution (inside Linux):
+
+```sh
+python3 -B tools/linux_worker_smoke.py --root <isolated-root> --evidence <owned-evidence-directory>
+# Only after readiness and the existing one-worker authorization:
+python3 -B tools/linux_worker_smoke.py --root <isolated-root> --evidence <owned-evidence-directory> --execute
+```
+
+Local ignored evidence: `runs/wsl-worker-20261008/` contains release pins,
+actual argv, effective-config-admitted.json, cgroup-lifecycle-admitted.json,
+mutation-final-execution.json and output-final-execution.json. Final config
+SHA-256: f39081db3a690a9a8e5e8254bcd47cbac732ece85bda47defe3a5acac97f0d7b.
+Prior failed receipts remain. No credentials are included or copied.
+
+Regression results: existing 105 orchestrator, 77 Jev and 12 Inventory tests
+all passed; four new deterministic rejection tests passed (198 total).
+Actual native canaries are separate evidence, not mock worker results.
+Independent security review accepted the final bounded smoke design after
+fixing marker spoof, self-mutation and cgroup identity gaps. No model has yet
+been invoked by this runner. User's default-home CLI screenshot (Sol/low)
+does not establish this isolated home's login, medium effort or containment.
+The later official status check in the exact isolated environment returned
+exit 0 and the runner returned READY_NO_MODEL_LAUNCHED. The existing one-worker
+authorization now permits its one-shot execution without another approval.
+
+Reviewer assurance: controller can bind executable/config/argv/process/
+artifact facts to this attempt; caller claims and assistant text are not
+provider attestation. Installed Thread model/reasoningEffort describe
+configured state, not authenticated per-turn execution. Actual provider
+model/effort remain UNKNOWN. Production reviewer, validators, native queue
+dispatch and merge acceptance stay blocked; a future smoke cannot unlock
+them or Phase 3 by itself.
+
 - DONE: custom configuration composition/provenance; tested durable lifecycle primitives; B exact-capability routing without Jev; bounded single mock attempt/evidence; review/merge rejection gates.
 - DONE in OFFLINE_TEST: trusted fixture importer, accepted dependency snapshots, continuous bounded supervisor, pinned synthetic command validators and isolated local merge conflict validation.
 - PARTIAL: full Rule-Based Orchestrator. Observed native review importer and production repo validators are not released; no shared cross-queue native slot ledger exists. The two-task cap is per controller, not authorization to run multiple controllers with native children.
