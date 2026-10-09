@@ -1173,3 +1173,15 @@ no-refill/review/integration latch、固定 cgroup resource metrics 與 Controll
 Global/Repo capacity、原生 safety、歷史 attempts 不變；Worker/Review turns 本輪均為 0。
 新真實雙 Worker v2 驗收 NOT_RUN，整體仍 PARTIAL；詳見
 [failure matrix、證據與下一個有界提案](parallel-worker-recovery.md)。
+
+## Real-game Parallel Campaign 02 — stopped on missing read target
+
+從 `09290f8` 依新授權建立 `game-parallel-20261010-02`；2/2 Worker dispatch、
+0/2 Review turns、零 attempt retry。兩 worktree readiness 各 308 tests/Typecheck/Build PASS；
+實際 native 程序重疊 12.023527 秒。Packaging Worker 讀取不存在的
+`tests/unity-preflight.test.ts`，分類器判 `TOOL_FAILURE_UNKNOWN` 並停止整體。
+兩 task CANCELLED、無檔案修改、無 accepted Artifact/Review/integration。
+歷史裁決不變；本輪 BLOCKED_NO_RETRY，整體 PARTIAL。16 owned units 已清空，
+冷重啟未補額度／重派工；110 evidence hashes 一致，346 regression PASS。
+原 Repo/Global/safety/capacity 不變，無 push/PR/merge。詳見
+[實際失敗、清理與最小下一步](game-parallel-campaign-02.md)。
