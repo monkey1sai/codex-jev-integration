@@ -76,7 +76,8 @@ class Supervisor:
                     while len(pending) < self.max_active and not self.stop.is_set():
                         if self.native_runner and any(r['state'] in {'HELD', 'FAILED', 'CANCELLED'}
                                                       for r in self.queue.snapshot()['tasks']):
-                            self.stop.set()
+                            if not self.queue.failures_are_isolated():
+                                self.stop.set()
                             break
                         claim = self.queue.claim(lease_seconds=60, capabilities=self.capabilities,
                                                  halt_on_failure=self.native_runner is not None)
@@ -133,7 +134,9 @@ class Supervisor:
                             outcome = future.result()
                             outcomes.append(outcome)
                             if self.native_runner and (not isinstance(outcome, dict) or outcome.get('status') != 'REVIEW'):
-                                self.stop.set()
+                                if not (isinstance(outcome, dict) and outcome.get('failure_scope') == 'TASK'
+                                        and self.queue.failures_are_isolated()):
+                                    self.stop.set()
                         except Exception as error:
                             self.queue.fence(claim, 'supervisor_exception')
                             outcomes.append({'status': 'HELD', 'reason': type(error).__name__})

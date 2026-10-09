@@ -217,7 +217,7 @@ def compile_policy(repo, *, defaults=None, session=None, execution_mode='high_as
             provenance['routing.jev_enabled'] = len(sources) - 1
     code_names = ("__init__.py", "contracts.py", "store.py", "policy.py", "tasks.py", "core_queue.py", "routing.py", "provision.py", "__main__.py", "phase2.py", "pipeline.py", "processes.py", "workspaces.py", "cli_adapter.py", "mock_v2_worker.py", "evidence.py", "snapshots.py", "validators.py", "supervisor.py", "merge_validation.py", "admission.py", "development.py", "worker_failures.py")
     code_hashes = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest() for name in code_names}
-    for name in ('orchestrator/repo_adapter.py', 'tools/game_repo_campaign.py', 'tools/repo_parallel_campaign.py', 'tools/game_repo_acceptance.mjs', 'tools/development_validator.py', 'tools/development_smoke.py', 'tools/linux_worker_smoke.py'):
+    for name in ('orchestrator/repo_adapter.py', 'tools/game_repo_campaign.py', 'tools/repo_parallel_campaign.py', 'tools/game_repo_acceptance.mjs', 'tools/development_validator.py', 'tools/development_tool_probe.py', 'tools/development_smoke.py', 'tools/linux_worker_smoke.py'):
         code_hashes[name] = hashlib.sha256((Path(__file__).resolve().parents[1] / name).read_bytes()).hexdigest()
     floors = deepcopy(FLOORS)
     floors['live_execution'] = execution_mode == 'development'

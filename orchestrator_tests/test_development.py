@@ -174,6 +174,7 @@ class DevelopmentContracts(Fixture):
                      patch.object(runner, '_settings', return_value=({}, {})), \
                      patch.object(runner, '_argv', return_value=['fixture-only']), \
                      patch.object(runner, '_pins', return_value=None), \
+                     patch.object(runner, 'tool_readiness', return_value={'inventory': {}, 'guidance': 'OFFLINE_TEST_ONLY'}), \
                      patch.object(runner, '_run', side_effect=launch):
                     result = runner.attempt(claim, threading.Event())
                 self.assertFalse(result['cleanup_known'])

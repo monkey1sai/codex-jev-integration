@@ -21,7 +21,14 @@ from .processes import jsonl_events
 from .pipeline import artifact_manifest
 from .snapshots import materialize
 from .workspaces import allocate, scan, git
-from .worker_failures import WorkerFailureMonitor, POLICY as FAILURE_POLICY
+from .worker_failures import WorkerFailureMonitor, POLICY as FAILURE_POLICY, classify
+
+
+class OrdinaryValidationFailure(ContractError):
+    """Known native validator assertion, not timeout/denial/unknown execution."""
+    def __init__(self, reason, evidence):
+        super().__init__(reason)
+        self.evidence = evidence
 
 
 def toml(value):
@@ -265,7 +272,7 @@ class NativeDevelopmentRunner:
                         'HOME': str(self.runtime / 'runtime-home'), 'TMPDIR': str(workspace / '.tmp')}}
         if self.repo_adapter:
             settings['shell_environment_policy.set']['PATH'] = str(Path(self.repo_adapter.value['node']).parent) + ':/usr/bin:/bin'
-            settings['shell_environment_policy.set'].update(UV_THREADPOOL_SIZE='2', RAYON_NUM_THREADS='2')
+            settings['shell_environment_policy.set'].update(UV_THREADPOOL_SIZE='2', RAYON_NUM_THREADS='2', GOMAXPROCS='2')
         return settings, fs
 
     def _argv(self, workspace, settings, *, server=False, schema=None, prompt=None):
@@ -294,7 +301,7 @@ class NativeDevelopmentRunner:
                           seconds, workspace, env, folder, prefix,
                           cancel=stop, before_terminate=fence, **callbacks)
 
-    def _monitor_claim(self, claim, folder, local_stop, shared_stop, *, policy=None):
+    def _monitor_claim(self, claim, folder, local_stop, shared_stop, *, policy=None, checks=(), seconds=None):
         queue = self.queue
         def fatal(reason):
             # Cancellation cannot wait behind SQLite's normal 10-second busy window.
@@ -313,13 +320,58 @@ class NativeDevelopmentRunner:
         return WorkerFailureMonitor(folder / 'failure-policy',
             {'queue_id': queue.queue_id, 'task_hash': claim['task_hash'],
              'attempt_id': claim['attempt_id'], 'epoch': claim['epoch'],
-             'policy_hash': queue.policy['policy_hash']}, claim['task']['budgets']['runtime_seconds'], fatal,
-            policy=policy)
+             'policy_hash': queue.policy['policy_hash']}, seconds or claim['task']['budgets']['runtime_seconds'], fatal,
+            policy=policy, checks=checks)
+
+    def tool_readiness(self, workspace, folder, role, allowed_files, binding, stop, processes):
+        """Controller-owned native probe in the worker's actual PATH/cwd/profile.
+
+        This is native-trust Development evidence, not live namespace attestation.
+        Runs before dispatch_intent and starts no provider turn.
+        """
+        from tools.development_tool_probe import TOOLS
+        probe = Path(__file__).resolve().parents[1] / 'tools/development_tool_probe.py'
+        python = Path('/usr/bin/python3').resolve(strict=True)
+        command = {'validator': 'tool-readiness', 'argv': [str(python), '-I', '-B', str(probe)],
+                   'files': {str(p): digest(p.read_bytes()) for p in (python, probe)}, 'timeout_seconds': 15}
+        plan = {**binding, 'native_config_hash': self.config_hash, 'probe': command}
+        row = self._validator_command(plan, command, workspace, folder, stop, processes,
+                                      role=role, allowed_files=allowed_files)
+        value = json.loads(row['result']['stdout'])
+        settings, _ = self._settings(workspace, allowed_files, role, command['files'])
+        if (set(value) != {'version', 'cwd', 'path', 'tools'} or value['version'] != 1
+                or value['cwd'] != str(workspace) or value['path'] != settings['shell_environment_policy.set']['PATH']
+                or set(value['tools']) != set(TOOLS)):
+            raise ContractError('TOOL_READINESS_BINDING')
+        for entry in value['tools'].values():
+            if (type(entry) is not dict or set(entry) != {'status', 'path', 'sha256'}
+                    or entry['status'] not in {'AVAILABLE', 'MISSING'}):
+                raise ContractError('TOOL_READINESS_SCHEMA')
+            if entry['status'] == 'MISSING':
+                if entry['path'] is not None or entry['sha256'] is not None:
+                    raise ContractError('TOOL_READINESS_SCHEMA')
+            elif (not isinstance(entry['path'], str) or not Path(entry['path']).is_absolute()
+                    or digest(guarded(entry['path']).read_bytes()) != entry['sha256']):
+                raise ContractError('TOOL_READINESS_EXECUTABLE_DRIFT')
+        for name in ('bash', 'python3', *(['node'] if self.repo_adapter else [])):
+            if value['tools'][name]['status'] != 'AVAILABLE':
+                raise ContractError('REQUIRED_TOOL_UNAVAILABLE:' + name)
+        guidance = ('Use only AVAILABLE tools below. If rg is missing, use available grep for content search, '
+                    'find for filenames, or Python3/Node standard-library file traversal. If python is missing, '
+                    'use the recorded python3 path. These alternatives grant no extra scope; obey allowed_files '
+                    'and the native sandbox. Do not install tools or probe credentials. Pinned tests must use exact argv.')
+        receipt = {**plan, 'inventory': value, 'guidance': guidance, 'native_evidence': row,
+                   'assurance': 'CONTROLLER_OBSERVED_NATIVE_COMMAND_EXEC_NOT_LIVE_NAMESPACE_ATTESTATION'}
+        frozen_bytes(folder / 'tool-readiness.json', canonical(receipt).encode())
+        return receipt
 
     def _maintain_claim(self, claim, done, monitor, local_stop, shared_stop):
         renewed = time.monotonic()
         while not done.wait(.2):
             try:
+                monitor.tick()
+                if monitor.stopped:
+                    return
                 if shared_stop.is_set():
                     monitor.stop('CANCELLED')
                     return
@@ -367,6 +419,7 @@ class NativeDevelopmentRunner:
         monitor = None
         execution = None
         processes = []
+        attempt_started = time.monotonic()
         try:
             if stop.is_set() or not queue.start(claim):
                 raise ContractError('STALE_OR_CANCELLED_START')
@@ -382,23 +435,40 @@ class NativeDevelopmentRunner:
             if self.repo_adapter:
                 self.repo_adapter.prepare(workspace)
             baseline = self._scan(workspace, ignore_scratch=True)
-            monitor = self._monitor_claim(claim, folder, local_stop, stop)
             settings, _ = self._settings(workspace, claim['task']['allowed_files'], claim['task']['execution'])
             check_plan = self.validators.plan(claim, workspace, for_worker=True) if required_checks else None
             worker_commands = [c for c in check_plan['commands'] if c['validator'] in required_checks] if check_plan else []
             if set(required_checks) != {c['validator'] for c in worker_commands}:
                 raise ContractError('WORKER_CHECK_PLAN_INCOMPLETE')
+            remaining = claim['task']['budgets']['runtime_seconds'] - (time.monotonic() - attempt_started)
+            if remaining <= 0:
+                raise ContractError('TASK_TIMEOUT_BEFORE_DISPATCH')
+            monitor = self._monitor_claim(claim, folder, local_stop, stop, checks=worker_commands, seconds=remaining)
+            heartbeat = threading.Thread(target=self._maintain_claim,
+                args=(claim, done, monitor, local_stop, stop), daemon=True)
+            heartbeat.start()
+            readiness = self.tool_readiness(workspace, folder, claim['task']['execution'],
+                claim['task']['allowed_files'], {'queue_id': queue.queue_id, 'task_hash': claim['task_hash'],
+                    'attempt_id': claim['attempt_id'], 'epoch': claim['epoch'], 'policy_hash': queue.policy['policy_hash']},
+                local_stop, processes)
             prompt = ('Complete this authorized development task using native tools. '
                       'Only edit allowed_files, including tests only when explicitly assigned. Do not spawn agents, change instructions/Git, '
                       'or access credentials, controller, other worktrees or network. '
                       'The controller independently repeats validation and review. '
                       'Known ordinary tool/test errors may be corrected in this same turn only: '
-                      'at most 3 failed tool events and 60 seconds from the first failure, within task timeout. '
+                      'at most 3 failed tool events and 60 cumulative repair seconds, within the immutable task timeout. '
+                      'Repair is resolved by successful execution of the SAME failed literal command, or ALL pinned '
+                      'acceptance checks after the last edit/failure/non-check command (also for legal missing-tool fallbacks); edits, '
+                      'prose or unrelated exit 0 do not resolve it. Exact pinned Test/Build commands have separate '
+                      'timeouts and pause repair accounting while their native command lifecycle is observed. '
                       'Never retry safety/permission denials or request a new attempt.\n' + canonical(claim['task']))
+            prompt += '\nController tool readiness: ' + canonical({
+                'inventory': readiness['inventory'], 'guidance': readiness['guidance'],
+                'receipt_hash': fingerprint(readiness)})
             if worker_commands:
                 prompt += ('\nRead the relevant declarations and tsconfig before editing. Before finishing, run ALL '
                            'following pinned checks yourself, after your final modifications. Use each exact literal command '
-                           'as a separate exec call, with no chaining, redirection or aliases. Fix ordinary failures within '
+                           'serially as separate exec calls, with no chaining, redirection or aliases. Fix ordinary failures within '
                            'the same existing turn budget; do not install dependencies. Build output belongs only in .tmp. '
                            'These checks must be your LAST tool calls: any later edit or non-check command invalidates them.\n'
                            + '\n'.join(shlex.join(c['argv']) for c in worker_commands))
@@ -406,7 +476,7 @@ class NativeDevelopmentRunner:
             intent = {'mode': 'DEVELOPMENT', 'queue_id': queue.queue_id, 'claim': claim,
                       'argv': argv, 'config_hash': self.config_hash, 'pins': {str(p): h for p, h in self.pins.items()},
                       'settings': settings, 'baseline': baseline, 'challenge': uuid.uuid4().hex,
-                      'worker_failure_policy': FAILURE_POLICY}
+                      'worker_failure_policy': FAILURE_POLICY, 'tool_readiness_hash': fingerprint(readiness)}
             if check_plan:
                 intent['worker_check_plan'] = check_plan
             if self.repo_adapter:
@@ -416,13 +486,10 @@ class NativeDevelopmentRunner:
                 raise ContractError('DISPATCH_REPLAY_OR_CANCELLED')
             with self._counter_lock:
                 self.dispatches += 1
-            heartbeat = threading.Thread(target=self._maintain_claim,
-                args=(claim, done, monitor, local_stop, stop), daemon=True)
-            heartbeat.start()
             worker_process = {'role': 'worker', 'execution': None}
             processes.append(worker_process)  # UNKNOWN before launch or a thrown _run.
             execution = self._run(argv, folder, 'worker', workspace,
-                                  claim['task']['budgets']['runtime_seconds'], local_stop,
+                                  max(.001, monitor.deadline - time.monotonic()), local_stop,
                                   lambda: monitor.stop('NATIVE_PROCESS_STOP'), monitor=monitor)
             worker_process['execution'] = execution
             if monitor.finish()['stopped']:
@@ -440,7 +507,24 @@ class NativeDevelopmentRunner:
             if self.artifact_guard:
                 for name in claim['task']['expected_artifacts']:
                     self.artifact_guard(guarded(workspace / name).read_bytes(), Path(name).stem)
-            validation = self.validate(claim, workspace, folder, local_stop, processes=processes)
+            try:
+                validation = self.validate(claim, workspace, folder, local_stop, processes=processes,
+                                           deadline=monitor.deadline)
+            except OrdinaryValidationFailure as failure:
+                if self._scan(workspace, ignore_scratch=True) != before_validation or not attempt_cleanup_known(processes):
+                    raise ContractError('LOCAL_FAILURE_CUSTODY_OR_CLEANUP_UNKNOWN') from failure
+                self._handoff_claim(claim, done, heartbeat, monitor, local_stop, stop)
+                report = {'status': 'BLOCKED', 'failure_scope': 'TASK', 'category': 'VALIDATOR_ASSERTION',
+                    'task_id': claim['task']['task_id'], 'task_hash': claim['task_hash'],
+                    'attempt_id': claim['attempt_id'], 'epoch': claim['epoch'], 'queue_id': queue.queue_id,
+                    'policy_hash': queue.policy['policy_hash'], 'reason': str(failure), 'no_retry': True,
+                    'process_tree_empty': True, 'provider_completion_known': True, 'completion': completed,
+                    'execution_hash': digest(raw), 'processes': processes, 'worker_failure_evidence': monitor.summary(),
+                    'validation_failure': failure.evidence}
+                frozen_bytes(folder / 'task-failure.json', canonical(report).encode())
+                if not queue.isolate_task_failure(claim, report):
+                    raise ContractError('STALE_LOCAL_FAILURE')
+                return report
             if self._scan(workspace, ignore_scratch=True) != before_validation:
                 raise ContractError('VALIDATOR_CHANGED_WORKSPACE')
             self._handoff_claim(claim, done, heartbeat, monitor, local_stop, stop)
@@ -498,7 +582,7 @@ class NativeDevelopmentRunner:
             if 'heartbeat' in locals():
                 heartbeat.join(timeout=3)
 
-    def validate(self, claim, workspace, folder, stop, *, processes=None):
+    def validate(self, claim, workspace, folder, stop, *, processes=None, deadline=None):
         processes = processes if processes is not None else []
         plan = self.validators.plan(claim, workspace)
         evidence = []
@@ -506,13 +590,19 @@ class NativeDevelopmentRunner:
             if stop.is_set() or self.validators.plan(claim, workspace) != plan:
                 raise ContractError('VALIDATOR_PLAN_DRIFT_OR_CANCELLED')
             evidence.append(self._validator_command(plan, command, workspace, folder, stop, processes,
-                            lambda: self.queue.fence(claim, 'native_validator_stop'), role=claim['task']['execution']))
+                            lambda: self.queue.fence(claim, 'native_validator_stop'), role=claim['task']['execution'],
+                            deadline=deadline))
         return evidence
 
-    def _validator_command(self, plan, command, workspace, folder, stop, processes, before_terminate=None, *, role=None):
+    def _validator_command(self, plan, command, workspace, folder, stop, processes, before_terminate=None, *, role=None, allowed_files=(), deadline=None):
         """Shared native-only path for attempt and reviewed integration checks."""
         role = role or self.queue.policy['settings']['roles']['worker']
-        settings, filesystem = self._settings(workspace, [], role, command['files'])
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 15:
+                raise ContractError('TASK_TIMEOUT_BEFORE_VALIDATOR')
+            command = {**command, 'timeout_seconds': min(command['timeout_seconds'], remaining - 15)}
+        settings, filesystem = self._settings(workspace, allowed_files, role, command['files'])
         request = {'plan_hash': fingerprint(plan), 'workspace': str(workspace), 'command': command,
                    'server_argv': self._argv(workspace, settings, server=True), 'expected_filesystem': filesystem}
         name = command['validator']
@@ -524,11 +614,21 @@ class NativeDevelopmentRunner:
         processes.append(active)
         execution = self._run(argv, folder, name, workspace, command['timeout_seconds'] + 15, stop, before_terminate)
         active['execution'] = execution
-        if not process_clean(execution) or execution.get('status') != 'EXITED' or execution.get('exit_code') != 0:
+        if not process_clean(execution) or execution.get('status') != 'EXITED':
             raise ContractError('NATIVE_VALIDATOR_FAILED')
         raw = (folder / (name + '.jsonl')).read_bytes()
         result = json.loads(raw)
-        if (result.get('status') != 'PASS' or result.get('local_fallback') is not False
+        if (execution.get('exit_code') == 1 and result.get('status') == 'FAIL'
+                and result.get('local_fallback') is False and result.get('plan_hash') == fingerprint(plan)):
+            native = result.get('result', {})
+            failure = {'type': 'item.completed', 'item': {'type': 'command_execution', 'status': 'failed',
+                'exit_code': native.get('exitCode'), 'aggregated_output': native.get('stdout', '') + native.get('stderr', '')}}
+            if classify(failure) == ('ORDINARY_TOOL_OR_TEST_FAILURE', 'RECOVER'):
+                raise OrdinaryValidationFailure('NATIVE_VALIDATOR_ASSERTION:' + name,
+                    {'validator': name, 'plan_hash': fingerprint(plan), 'command_hash': fingerprint(command),
+                     'native_raw_sha256': digest(raw), 'execution_hash': fingerprint(execution),
+                     'native_result': native, 'local_fallback': False})
+        if (execution.get('exit_code') != 0 or result.get('status') != 'PASS' or result.get('local_fallback') is not False
                 or result.get('plan_hash') != fingerprint(plan) or result['result']['exitCode'] != 0):
             raise ContractError('NATIVE_VALIDATOR_EVIDENCE')
         if name in self.expected_stdout and result['result'].get('stdout') != self.expected_stdout[name]:
@@ -543,11 +643,13 @@ class NativeDevelopmentRunner:
         from .merge_validation import reviewed_batch, prepare_integration, verify_integration
         queue = self.queue
         batch = reviewed_batch(queue, task_ids)
+        if queue.task_failure_latched():
+            raise ContractError('CAMPAIGN_TASK_FAILURE_NO_INTEGRATION')
         nonce = uuid.uuid4().hex
         folder = queue.path.parent / 'integration-execution' / nonce
         folder.mkdir(parents=True, exist_ok=False)
         with queue.transaction() as db:
-            if db.execute('SELECT 1 FROM integration_failures LIMIT 1').fetchone():
+            if db.execute('SELECT 1 FROM integration_failures UNION ALL SELECT 1 FROM isolated_task_failures LIMIT 1').fetchone():
                 raise ContractError('INTEGRATION_FAILURE_STOP')
             if (db.execute("SELECT 1 FROM tasks WHERE state IN ('CLAIMED','RUNNING','VALIDATING','HELD') LIMIT 1").fetchone()
                     or db.execute('SELECT 1 FROM development_native_slots LIMIT 1').fetchone()):
@@ -634,11 +736,13 @@ class NativeDevelopmentRunner:
         return result
 
     def review(self, task_id, stop):
+        if self.queue.task_failure_latched():
+            raise ContractError('CAMPAIGN_TASK_FAILURE_NO_REVIEW')
         queue = self.queue
         # Only this method can publish Development reviews, immediately after
         # controller launch/completion. No caller-supplied review receipt API.
         with queue.transaction() as db:
-            if db.execute('SELECT 1 FROM integration_failures LIMIT 1').fetchone():
+            if db.execute('SELECT 1 FROM integration_failures UNION ALL SELECT 1 FROM isolated_task_failures LIMIT 1').fetchone():
                 stop.set()
                 return {'status': 'BLOCKED', 'reason': 'INTEGRATION_FAILURE_STOP', 'task_id': task_id}
             if db.execute('SELECT 1 FROM development_review_dispatch WHERE task=?', (task_id,)).fetchone():
@@ -660,7 +764,7 @@ class NativeDevelopmentRunner:
             'findings': {'type': 'array', 'items': {'type': 'string'}}},
             'required': ['decision', 'findings'], 'additionalProperties': False}).encode())
         with queue.transaction() as db:
-            if db.execute('SELECT 1 FROM integration_failures LIMIT 1').fetchone():
+            if db.execute('SELECT 1 FROM integration_failures UNION ALL SELECT 1 FROM isolated_task_failures LIMIT 1').fetchone():
                 stop.set()
                 return {'status': 'BLOCKED', 'reason': 'INTEGRATION_FAILURE_STOP', 'task_id': task_id}
             owner = db.execute('SELECT * FROM supervisor_lock').fetchone()

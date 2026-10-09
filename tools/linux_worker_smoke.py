@@ -173,6 +173,32 @@ def check_add_artifact(data):
         raise ValueError('PURE_ADD_EXPRESSION_REQUIRED')
 
 
+def resource_sample(group):
+    """Kernel counters only, never an inferred provider/token measurement."""
+    def integer(name):
+        value = int((group / name).read_text().strip())
+        if value < 0:
+            raise ValueError('RESOURCE_COUNTER_UNKNOWN')
+        return value
+    def counters(name):
+        values = dict(line.split() for line in (group / name).read_text().splitlines())
+        return {k: int(v) for k, v in values.items()}
+    value = {'observed_unix': time.time(), 'pids_current': integer('pids.current'),
+             'memory_current_bytes': integer('memory.current'), 'memory_peak_bytes': integer('memory.peak'),
+             'cpu_stat': counters('cpu.stat'), 'memory_events': counters('memory.events'),
+             'pids_events': counters('pids.events'),
+             'process_ids': [int(v) for v in (group / 'cgroup.procs').read_text().split()]}
+    if (value['pids_current'] > 64 or value['memory_current_bytes'] > 1073741824
+            or any(v < 0 for key in ('cpu_stat', 'memory_events', 'pids_events') for v in value[key].values())):
+        raise ValueError('RESOURCE_COUNTER_UNKNOWN')
+    return value
+
+
+def resource_limit_hit(sample):
+    return (any(sample['memory_events'].get(k, 0) > 0 for k in ('oom', 'oom_kill'))
+            or sample['pids_events'].get('max', 0) > 0)
+
+
 def run_cgroup(command, unit, seconds, repo, env, evidence, prefix, *, cancel=None, before_terminate=None,
                on_output=None, on_tick=None, on_eof=None, control_unknown=None):
     """Own descendants independently of launcher lifetime; cap each output stream."""
@@ -184,11 +210,16 @@ def run_cgroup(command, unit, seconds, repo, env, evidence, prefix, *, cancel=No
             '--property=TasksMax=64',
             '/usr/bin/env', '-i', *[k+'='+v for k, v in env.items()], *command]
     record = {'argv': argv, 'unit': unit, 'status': 'STARTING', 'started_unix': time.time()}
+    deadline = time.monotonic() + seconds
     exceeded = threading.Event()
     control_failed = threading.Event()
     fence_lock = threading.Lock()
     handles = []
     process = None
+    next_resource_sample = 0
+    resources = {'status': 'UNKNOWN', 'scope': 'SAMPLED_OWNED_CGROUP_NOT_FULL_LIFETIME',
+                 'samples': 0, 'pids_peak_observed': 0, 'memory_peak_bytes_observed': 0}
+    record['resources'] = resources
     def fence_before_stop():
         with fence_lock:
             if record.get('fence_callback_attempted'):
@@ -233,7 +264,6 @@ def run_cgroup(command, unit, seconds, repo, env, evidence, prefix, *, cancel=No
         for stream, suffix in ((process.stdout, '.jsonl'), (process.stderr, '.log')):
             handle = threading.Thread(target=pump, args=(stream, evidence/(prefix+suffix), suffix == '.jsonl'), daemon=True)
             handle.start(); handles.append(handle)
-        deadline = time.monotonic()+seconds+5
         record['unit_details'] = ''
         while (process.poll() is None and not exceeded.is_set() and not control_failed.is_set() and time.monotonic() < deadline
                and not (cancel is not None and cancel.is_set())):
@@ -254,6 +284,25 @@ def run_cgroup(command, unit, seconds, repo, env, evidence, prefix, *, cancel=No
                         folder = Path('/sys/fs/cgroup'+expected)
                         record['kernel_resource_limits'] = {name: (folder/name).read_text().strip()
                                                            for name in ('memory.max', 'memory.swap.max', 'pids.max')}
+            if record.get('kernel_resource_limits') and time.monotonic() >= next_resource_sample:
+                try:
+                    sample = resource_sample(Path('/sys/fs/cgroup' + expected))
+                    resources.update(status='OBSERVED', samples=resources['samples'] + 1, last_sample=sample,
+                        pids_peak_observed=max(resources['pids_peak_observed'], sample['pids_current']),
+                        memory_peak_bytes_observed=max(resources['memory_peak_bytes_observed'], sample['memory_peak_bytes']))
+                    resources['minimum_pids_headroom_observed'] = 64 - resources['pids_peak_observed']
+                    if resource_limit_hit(sample):
+                        resources['status'] = 'LIMIT_HIT'
+                        control_failed.set()
+                        fence_before_stop()
+                except (OSError, ValueError) as error:
+                    # A collected unit may vanish between poll and sample. Never
+                    # pretend missing metrics prove headroom or normal completion.
+                    resources.update(status='UNKNOWN', error=type(error).__name__)
+                    if process.poll() is None:
+                        control_failed.set()
+                        fence_before_stop()
+                next_resource_sample = time.monotonic() + .5
             time.sleep(.05)
         record['output_limit_exceeded'] = exceeded.is_set()
         if (process.poll() is None or control_failed.is_set()

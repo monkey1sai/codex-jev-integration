@@ -1161,3 +1161,15 @@ Frozen source、92 檔 evidence custody、清理與冷重啟停止已核對，33
 原 Repo HEAD/max_active=1、Global production、Failure Policy 與歷史 FAIL 不變。
 完整限制與下一步見 [actual Campaign report](game-parallel-campaign-01.md)；不將此結果
 改稱遊戲交付成功或 5-worker admission。
+
+## Parallel Worker readiness / recovery — zero Provider increment
+
+基準 `ee33371`。延伸既有 Runner/Queue/Supervisor：native tool inventory、v2 累計修復時間與
+pinned check/task deadline 分離、已完成且 clean 的普通 validator failure 局部隔離、durable
+no-refill/review/integration latch、固定 cgroup resource metrics 與 Controller timeout fencing。
+原 241 tests 保留，加 16 項 causal tests；257 + 77 + 12 = 346 regression PASS。
+零 Provider native 遊戲 308 tests / Typecheck / Build / cancel / timeout 診斷 02 PASS；
+診斷 01 timeout FAIL 與原雙 Worker Campaign BLOCKED_NO_RETRY 均保留。
+Global/Repo capacity、原生 safety、歷史 attempts 不變；Worker/Review turns 本輪均為 0。
+新真實雙 Worker v2 驗收 NOT_RUN，整體仍 PARTIAL；詳見
+[failure matrix、證據與下一個有界提案](parallel-worker-recovery.md)。

@@ -71,6 +71,11 @@ def prepare(root, runtime):
         before = adapter.scan(workspace, ignore_scratch=True)
         results['worker-' + str(n)] = native_check(runner, workspace, folder, 'readiness-' + str(n),
             ['/usr/bin/true'], write=True, allowed_files=task['allowed_files'])
+        tools_folder = folder / ('tools-' + str(n))
+        tools_folder.mkdir()
+        results['tools-' + str(n)] = runner.tool_readiness(workspace, tools_folder, task['execution'],
+            task['allowed_files'], {**binding, 'task_hash': fingerprint(task), 'probe_nonce': uuid.uuid4().hex},
+            threading.Event(), [])
         # thread/start is checked by these exact existing readiness probe names.
         if n == 0:
             results['session'] = native_check(runner, workspace, folder, 'readiness', ['/usr/bin/true'])
