@@ -65,9 +65,10 @@ def task(queue):
         'review': {'required': True, 'independent': True}}
 
 
-def native_check(runner, workspace, folder, name, argv, *, write=False, role='worker'):
+def native_check(runner, workspace, folder, name, argv, *, write=False, role='worker', allowed_files=None):
     expected_role = runner.queue.policy['settings']['roles'][role]
-    settings, fs = runner._settings(workspace, ALLOWED if write else [], expected_role, [argv[0]])
+    scope = ALLOWED if allowed_files is None else allowed_files
+    settings, fs = runner._settings(workspace, scope if write else [], expected_role, [argv[0]])
     command = {'argv': argv, 'timeout_seconds': 120}
     plan = {'plan_hash': fingerprint(command), 'workspace': str(workspace), 'command': command,
             'server_argv': runner._argv(workspace, settings, server=True), 'expected_filesystem': fs,

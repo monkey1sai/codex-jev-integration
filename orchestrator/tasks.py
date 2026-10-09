@@ -10,8 +10,11 @@ KEYS = {"schema_version", "task_id", "goal", "inputs", "allowed_files", "depende
 
 
 def validate_task(task, policy):
-    if type(task) is not dict or set(task) != KEYS or type(task["schema_version"]) is not int or task["schema_version"] != 2:
+    if type(task) is not dict or set(task) - {'priority'} != KEYS or type(task["schema_version"]) is not int or task["schema_version"] != 2:
         raise ContractError("CONTRACT_SCHEMA")
+    # Controller-owned immutable contract metadata, never execution authority.
+    if type(task.get('priority', 0)) is not int or not 0 <= task.get('priority', 0) <= 100:
+        raise ContractError('PRIORITY')
     identifier(task["task_id"])
     if not isinstance(task["goal"], str) or not 1 <= len(task["goal"]) <= 4000:
         raise ContractError("GOAL")

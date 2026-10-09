@@ -25,6 +25,16 @@ def identifier(value):
     return value
 
 
+def resource_units(value):
+    if type(value) is not dict or len(value) > 16:
+        raise ContractError('RESOURCE_CONFIG')
+    for name, units in value.items():
+        identifier(name)
+        if type(units) is not int or not 1 <= units <= 65536:
+            raise ContractError('RESOURCE_CONFIG')
+    return value
+
+
 def safe_path(root, relative):
     """Reject all symlinks/junctions, including ancestors of the explicit root."""
     root = Path(root).absolute()
@@ -78,6 +88,9 @@ def validate_overlay(value):
             raise ContractError("REVIEW_FLOOR")
     caps = {"max_active": 2, "max_queued": 1000, "max_dispatches": 1000, "max_attempts": 2}
     for key, number in value.get("scheduler", {}).items():
+        if key == 'resource_limits':
+            resource_units(number)
+            continue
         if key not in caps or type(number) is not int or not 1 <= number <= caps[key]:
             raise ContractError("SCHEDULER_LIMIT")
     for key, option in value.get("routing", {}).items():
@@ -88,8 +101,9 @@ def validate_overlay(value):
         raise ContractError("ROUTING_CONFIG")
     for name, cap in value.get("capabilities", {}).items():
         identifier(name)
-        if type(cap) is not dict or set(cap) != {"role", "description", "allowed_files", "validators"}:
+        if type(cap) is not dict or set(cap) - {'resources'} != {"role", "description", "allowed_files", "validators"}:
             raise ContractError("CAPABILITY_CONFIG")
+        resource_units(cap.get('resources', {}))
         if not isinstance(cap["role"], str) or cap["role"] not in {"worker", "researcher", "reviewer"} or not isinstance(cap["description"], str) or not 1 <= len(cap["description"]) <= 2000:
             raise ContractError("CAPABILITY_CONFIG")
         for field in ("allowed_files", "validators"):
@@ -148,6 +162,7 @@ def compile_policy(repo, *, defaults=None, session=None, execution_mode='high_as
                 yield name
     provenance = {key: 0 for key in leaves(base)}
     override = safe_path(repo, ".codex/orchestrator.json")
+    local = {}
     if override.exists():
         local, digest = load(override)
         base = merge(base, local)
@@ -155,12 +170,24 @@ def compile_policy(repo, *, defaults=None, session=None, execution_mode='high_as
         provenance.update({key: len(sources) - 1 for key in leaves(local)})
     if session is not None:
         validate_overlay(session)
+        # An explicit repo ceiling cannot be silently raised by a session.
+        for key, ceiling in local.get('scheduler', {}).items():
+            option = session.get('scheduler', {}).get(key)
+            if option is None:
+                continue
+            if key == 'resource_limits':
+                if any(option.get(name, limit) > limit for name, limit in ceiling.items()):
+                    raise ContractError('REPO_SCHEDULER_CEILING')
+            elif option > ceiling:
+                raise ContractError('REPO_SCHEDULER_CEILING')
         # A session may specialize work but cannot weaken explicit repo acceptance.
         for name, cap in session.get('capabilities', {}).items():
             old = base['capabilities'].get(name)
             if old and (not set(old['validators']) <= set(cap['validators'])
                         or not set(cap['allowed_files']) <= set(old['allowed_files'])
-                        or cap['role'] != old['role']):
+                        or cap['role'] != old['role']
+                        or any(cap.get('resources', {}).get(r, 0) < units
+                               for r, units in old.get('resources', {}).items())):
                 raise ContractError('REPO_ACCEPTANCE_DOWNGRADE')
         for name, validator in session.get('validators', {}).items():
             if name in base['validators'] and validator != base['validators'][name]:
@@ -175,6 +202,9 @@ def compile_policy(repo, *, defaults=None, session=None, execution_mode='high_as
     for cap in base["capabilities"].values():
         if set(cap["validators"]) - set(base["validators"]):
             raise ContractError("UNKNOWN_VALIDATOR")
+        for name, units in cap.get('resources', {}).items():
+            if units > base['scheduler'].get('resource_limits', {}).get(name, 0):
+                raise ContractError('RESOURCE_REQUIREMENT')
     # Jev has its own existing precedence, kept separate from controller policy.
     jev_path = safe_path(repo, ".codex/jev.json")
     if jev_path.exists():
@@ -187,7 +217,7 @@ def compile_policy(repo, *, defaults=None, session=None, execution_mode='high_as
             provenance['routing.jev_enabled'] = len(sources) - 1
     code_names = ("__init__.py", "contracts.py", "store.py", "policy.py", "tasks.py", "core_queue.py", "routing.py", "provision.py", "__main__.py", "phase2.py", "pipeline.py", "processes.py", "workspaces.py", "cli_adapter.py", "mock_v2_worker.py", "evidence.py", "snapshots.py", "validators.py", "supervisor.py", "merge_validation.py", "admission.py", "development.py", "worker_failures.py")
     code_hashes = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest() for name in code_names}
-    for name in ('orchestrator/repo_adapter.py', 'tools/game_repo_campaign.py', 'tools/game_repo_acceptance.mjs', 'tools/development_validator.py', 'tools/development_smoke.py', 'tools/linux_worker_smoke.py'):
+    for name in ('orchestrator/repo_adapter.py', 'tools/game_repo_campaign.py', 'tools/repo_parallel_campaign.py', 'tools/game_repo_acceptance.mjs', 'tools/development_validator.py', 'tools/development_smoke.py', 'tools/linux_worker_smoke.py'):
         code_hashes[name] = hashlib.sha256((Path(__file__).resolve().parents[1] / name).read_bytes()).hexdigest()
     floors = deepcopy(FLOORS)
     floors['live_execution'] = execution_mode == 'development'

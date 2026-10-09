@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from orchestrator.contracts import canonical, ContractError
+from orchestrator.contracts import canonical, fingerprint, ContractError
 from orchestrator.evidence import digest, frozen_bytes
 from orchestrator.pipeline import artifact_manifest
 from orchestrator.repo_adapter import RepoAdapter, repository_scan
@@ -153,6 +153,75 @@ class RealRepoAdapter(unittest.TestCase):
         queue.policy['settings']['scheduler']['max_dispatches'] = 2
         with self.assertRaisesRegex(ContractError, 'BINDING'):
             self.adapter.bind(queue, self.root, self.repo)
+
+    def campaign_adapter(self, reviews=2):
+        tasks = {}
+        self.campaign_tasks = []
+        for number, name in enumerate(self.value['allowed_files']):
+            task = {**self.claim['task'], 'task_id': 'game-' + str(number),
+                    'schema_version': 2, 'goal': 'Public packaging task', 'dependencies': [],
+                    'allowed_files': [name], 'tests': ['unit'], 'expected_artifacts': [name],
+                    'budgets': {'attempts': 1, 'runtime_seconds': 60}, 'resource_locks': [],
+                    'capability': 'packaging', 'acceptance_criteria': ['Pinned checks pass'],
+                    'execution': {'role': 'worker', 'model': 'gpt-6.1-sol', 'reasoning_effort': 'medium', 'native_children': 0},
+                    'authorization': {'external_writes': False, 'scope': 'allocated_attempt_only'},
+                    'review': {'required': True, 'independent': True}}
+            self.campaign_tasks.append(task)
+            tasks[task['task_id']] = {'task_hash': fingerprint(task), 'allowed_files': [name],
+                                     'validators': ['unit'], 'worker_checks': ['unit']}
+        self.value['campaign'] = {'campaign_id': self.root.name, 'max_active': 2,
+                                 'worker_budget': 2, 'review_budget': reviews, 'tasks': tasks}
+        self.record.write_text(canonical(self.value))
+        return RepoAdapter(self.root)
+
+    def test_parallel_entrypoint_validates_exact_dag_and_budget_without_inference(self):
+        from tools.repo_parallel_campaign import check_contracts
+        adapter = self.campaign_adapter()
+        session = {'routing': {'jev_enabled': False},
+            'scheduler': {'max_active': 2, 'max_dispatches': 2, 'max_attempts': 1},
+            'capabilities': {'packaging': {'role': 'worker', 'description': 'Packaging',
+                'allowed_files': self.value['allowed_files'], 'validators': ['unit']}},
+            'validators': {'unit': {'argv': ['fixed-check'], 'timeout_seconds': 60}}}
+        queue = Phase2Queue(self.root / 'controller/entry.sqlite', self.repo,
+                            evidence_mode='DEVELOPMENT', session=session)
+        check_contracts(queue, adapter, self.campaign_tasks)
+        self.assertEqual(queue.snapshot()['budget']['used'], 0)
+        self.assertEqual(queue.snapshot()['tasks'], [])
+        with self.assertRaisesRegex(ContractError, 'CAMPAIGN_TASK_SET'):
+            check_contracts(queue, adapter, self.campaign_tasks[:1])
+
+    def test_multi_task_adapter_pins_contracts_and_bounded_budget(self):
+        adapter = self.campaign_adapter()
+        session = {'routing': {'jev_enabled': False}, 'scheduler': {'max_active': 2, 'max_dispatches': 2, 'max_attempts': 1}}
+        queue = Phase2Queue(self.root / 'controller/parallel.sqlite', self.repo,
+                            evidence_mode='DEVELOPMENT', session=session)
+        adapter.bind(queue, self.root, self.repo)
+        self.assertEqual(adapter.review_budget, 2)
+        for task in self.campaign_tasks:
+            self.assertEqual(adapter.authorize_task(task), ['unit'])
+        task = {**self.campaign_tasks[0], 'goal': 'different goal'}
+        with self.assertRaisesRegex(ContractError, 'CONTRACT_DRIFT'):
+            adapter.authorize_task(task)
+
+    def test_multi_task_adapter_cannot_override_repo_active_ceiling(self):
+        adapter = self.campaign_adapter()
+        (self.repo / '.codex').mkdir()
+        (self.repo / '.codex/orchestrator.json').write_text(canonical({'scheduler': {'max_active': 1}}))
+        with self.assertRaisesRegex(ContractError, 'REPO_SCHEDULER_CEILING'):
+            Phase2Queue(self.root / 'controller/parallel.sqlite', self.repo, evidence_mode='DEVELOPMENT',
+                session={'scheduler': {'max_active': 2, 'max_dispatches': 2, 'max_attempts': 1}})
+        self.assertEqual(adapter.campaign['max_active'], 2)  # Marker is not authority.
+
+    def test_campaign_tamper_restart_unknown_task_and_excess_budget_rejected(self):
+        adapter = self.campaign_adapter()
+        with self.assertRaisesRegex(ContractError, 'CONTRACT_DRIFT'):
+            adapter.authorize_task({**self.campaign_tasks[0], 'task_id': 'unapproved'})
+        self.value['campaign']['worker_budget'] = 3
+        self.record.write_text(canonical(self.value))
+        with self.assertRaisesRegex(ContractError, 'ADAPTER_DRIFT'):
+            adapter.verify()
+        with self.assertRaisesRegex(ContractError, 'CAMPAIGN_LIMIT'):
+            RepoAdapter(self.root)
 
     def test_fresh_adapter_cannot_rebind_changed_dependency_identity(self):
         session = {'routing': {'jev_enabled': False}, 'scheduler': {'max_dispatches': 1}}

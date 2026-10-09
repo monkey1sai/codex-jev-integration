@@ -1139,3 +1139,13 @@ baseline 308 game tests、tsc/Vite build、scope/cleanup/readiness bindings PASS
 安全修正只加 Development 單次 warning suppression，error/UNKNOWN仍停止；其 native
 Worker 效果 NOT_RUN。沒有重派、Global/權限變更、Jev Phase3、push/PR/merge。
 單 Worker 真實遊戲交付尚未完成；需新的明確有界模型額度才能進下一次 attempt。
+
+## 2026-10-09 Parallel Worker orchestration increment
+
+基準 `54677b6`；詳見 [parallel controller / Campaign proposal](parallel-worker-development.md)。
+沿用既有 Queue/Supervisor/Runner/RepoAdapter，新增 priority、可信資源配額、Repo ceiling、
+多任務契約預算、最後修改後 Worker checks、reviewed native integration 與 durable failure stop。
+新入口只組合既有元件，不授權 inference 或提高容量。原 game max_active=1、歷史
+05/06 FAIL/PARTIAL、Global production 與高保證 optional gates 均保留。
+新真實遊戲雙 Worker/Review/Integration **NOT_RUN**；需獨立 2 Worker＋2 Review、零 retry
+及隔離 clone 的 max_active=2 明確批准。整體 Agent Factory 仍 **PARTIAL**。

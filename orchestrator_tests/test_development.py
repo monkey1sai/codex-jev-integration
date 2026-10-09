@@ -396,6 +396,61 @@ class DevelopmentContracts(Fixture):
 
 
 class NativeEvidence(unittest.TestCase):
+    def test_native_validator_exit_zero_without_controller_marker_is_rejected(self):
+        import tempfile
+        import threading
+        from pathlib import Path
+        from types import SimpleNamespace
+        from orchestrator.development import NativeDevelopmentRunner
+        from orchestrator.contracts import fingerprint
+        runner = NativeDevelopmentRunner.__new__(NativeDevelopmentRunner)
+        runner.queue = SimpleNamespace(policy={'settings': {'roles': {'worker': {}}}, 'policy_hash': 'pinned'})
+        runner.expected_stdout = {'oracle': 'CONTROLLER_ORACLE_PASS\n'}
+        runner._settings = lambda *args: ({}, {})
+        runner._argv = lambda *args, **kwargs: ['native-seam-only']
+        plan = {'pinned': 'registry'}
+        command = {'validator': 'oracle', 'files': {}, 'timeout_seconds': 1}
+        def run(argv, folder, name, *args):
+            (folder / (name + '.jsonl')).write_text(json.dumps({'status': 'PASS', 'local_fallback': False,
+                'plan_hash': fingerprint(plan), 'result': {'exitCode': 0, 'stdout': ''}}))
+            return clean_process()
+        runner._run = run
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaisesRegex(ContractError, 'COMPLETION_MARKER_MISSING'):
+                runner._validator_command(plan, command, Path(temp), Path(temp), threading.Event(), [])
+
+    def test_required_worker_checks_must_follow_final_edit_and_unknown_commands(self):
+        from orchestrator.development import worker_checks_evidence
+        command = {'validator': 'unit', 'argv': ['/trusted/check'], 'argv_hash': 'pinned'}
+        check = {'type': 'item.completed', 'item': {'id': 'check', 'type': 'command_execution',
+                  'status': 'completed', 'exit_code': 0, 'command': '/trusted/check'}}
+        edit = {'type': 'item.completed', 'item': {'type': 'file_change', 'status': 'completed'}}
+        unknown = {'type': 'item.completed', 'item': {'type': 'command_execution', 'status': 'completed',
+                    'exit_code': 0, 'command': '/bin/sh -c "touch source.py"'}}
+        def raw(events):
+            return ('\n'.join(json.dumps(e) for e in events) + '\n').encode()
+        for tail in (edit, unknown):
+            with self.assertRaisesRegex(ContractError, 'CHECK_NOT_OBSERVED'):
+                worker_checks_evidence(raw([check, tail]), [command])
+            self.assertEqual(len(worker_checks_evidence(raw([tail, check]), [command])), 1)
+
+    def test_required_worker_checks_need_exact_successful_native_commands(self):
+        import shlex
+        from orchestrator.development import worker_checks_evidence
+        argv = ['/trusted/node', '--v8-pool-size=2', 'node_modules/typescript/bin/tsc', '--noEmit']
+        command = {'validator': 'typecheck', 'argv': argv, 'argv_hash': 'pinned'}
+        def event(text, status='completed', exit_code=0):
+            return json.dumps({'type': 'item.completed', 'item': {'id': 'check-1',
+                'type': 'command_execution', 'status': status, 'exit_code': exit_code, 'command': text}}).encode() + b'\n'
+        wrapper = '/bin/bash -lc ' + shlex.quote(shlex.join(argv))
+        self.assertEqual(worker_checks_evidence(event(wrapper), [command])[0]['native_item_ids'], ['check-1'])
+        for raw in (event(wrapper, exit_code=1), event(wrapper, status='failed'),
+                    event('echo ' + shlex.quote(shlex.join(argv))),
+                    event(wrapper + ' ; true'),
+                    b'{"type":"item.completed","item":{"type":"agent_message","text":"typecheck passed"}}\n'):
+            with self.subTest(raw=raw), self.assertRaisesRegex(ContractError, 'CHECK_NOT_OBSERVED'):
+                worker_checks_evidence(raw, [command])
+
     def test_pure_fixture_rejects_import_time_exit_and_wrong_operation(self):
         fixture_arithmetic(b'def add(a,b): return a+b\n', 'add')
         for data in (b'import sys; sys.exit(0)\n', b'def add(a,b): return a-b\n',

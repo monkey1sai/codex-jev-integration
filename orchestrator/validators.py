@@ -31,9 +31,37 @@ class ValidatorRegistry:
             if db.execute('SELECT hash FROM validator_binding').fetchone()[0] != sha256:
                 raise ContractError('VALIDATOR_BINDING_DRIFT')
 
-    def plan(self, claim, workspace):
+    def plan(self, claim, workspace, *, for_worker=False):
         """Verify the complete pinned command chain without launching anything."""
-        self.queue.artifacts.authenticate(claim, {'VALIDATING'})
+        if type(for_worker) is not bool:
+            raise ContractError('VALIDATOR_PHASE')
+        self.queue.artifacts.authenticate(claim, {'RUNNING'} if for_worker else {'VALIDATING'})
+        plans = self._commands(claim['task'], workspace)
+        return {'queue_id': self.queue.queue_id, 'task_id': claim['task']['task_id'],
+                'task_hash': claim['task_hash'], 'attempt_id': claim['attempt_id'], 'epoch': claim['epoch'],
+                'policy_hash': self.queue.policy['policy_hash'], 'trusted_registry': self.sha256,
+                'workspace': str(workspace), 'mode': self.queue.evidence_mode, 'commands': plans,
+                'execution_authorized': False}
+
+    def integration_plan(self, prepared):
+        from .merge_validation import verify_integration
+        verify_integration(self.queue, prepared)
+        plans = {}
+        with self.queue.transaction() as db:
+            tasks = [json.loads(db.execute('SELECT contract FROM tasks WHERE id=?', (key,)).fetchone()[0])
+                     for key in prepared['task_ids']]
+        for task in tasks:
+            for command in self._commands(task, prepared['workspace']):
+                previous = plans.get(command['validator'])
+                if previous:
+                    command['timeout_seconds'] = min(command['timeout_seconds'], previous['timeout_seconds'])
+                plans[command['validator']] = command
+        return {'queue_id': self.queue.queue_id, 'policy_hash': self.queue.policy['policy_hash'],
+                'trusted_registry': self.sha256, 'mode': self.queue.evidence_mode,
+                'prepared_hash': fingerprint(prepared), 'commands': list(plans.values()),
+                'execution_authorized': False}
+
+    def _commands(self, task, workspace):
         self.queue._fresh()
         from .policy import load
         if load(self.path)[1] != self.sha256:
@@ -42,7 +70,7 @@ class ValidatorRegistry:
         workspace = guarded(workspace).resolve(strict=True)
         if not workspace.is_dir():
             raise ContractError('VALIDATOR_WORKSPACE')
-        for name in claim['task']['tests']:
+        for name in task['tests']:
             config = self.queue.policy['settings']['validators'].get(name)
             pinned = self.value['validators'].get(name)
             if not config or not pinned or set(pinned) != {'config_hash', 'argv', 'files'} or pinned['config_hash'] != fingerprint(config):
@@ -61,14 +89,10 @@ class ValidatorRegistry:
             if argv[0] not in pinned['files']:
                 raise ContractError('VALIDATOR_EXECUTABLE_UNPINNED')
             # Literal argv only, no task interpolation, PATH lookup or shell=True.
-            timeout = min(config['timeout_seconds'], claim['task']['budgets']['runtime_seconds'])
+            timeout = min(config['timeout_seconds'], task['budgets']['runtime_seconds'])
             plans.append({'validator': name, 'argv': list(argv), 'files': dict(pinned['files']),
                           'timeout_seconds': timeout, 'argv_hash': fingerprint(argv)})
-        return {'queue_id': self.queue.queue_id, 'task_id': claim['task']['task_id'],
-                'task_hash': claim['task_hash'], 'attempt_id': claim['attempt_id'], 'epoch': claim['epoch'],
-                'policy_hash': self.queue.policy['policy_hash'], 'trusted_registry': self.sha256,
-                'workspace': str(workspace), 'mode': self.queue.evidence_mode, 'commands': plans,
-                'execution_authorized': False}
+        return plans
 
     def _blocked(self, claim, plan, reason):
         receipt = {'plan': plan, 'execution': 'NOT_RUN', 'admission': 'BLOCKED', 'reason': reason,

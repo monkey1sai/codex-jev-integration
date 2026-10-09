@@ -47,8 +47,10 @@ class Supervisor:
     def run(self, *, max_seconds=30, behavior='valid'):
         if type(max_seconds) not in (int, float) or not 0 < max_seconds <= 600:
             raise ContractError('SUPERVISOR_RUNTIME')
-        deadline = time.monotonic() + max_seconds
+        started = time.monotonic()
+        deadline = started + max_seconds
         pending, outcomes = {}, []
+        peak_submissions = 0
         pool = ThreadPoolExecutor(max_workers=self.max_active)
         renew_done = threading.Event()
         def maintain_owner():
@@ -68,6 +70,9 @@ class Supervisor:
             try:
                 while not self.stop.is_set() and time.monotonic() < deadline:
                     self._renew()
+                    if self.queue.integration_stopped():
+                        self.stop.set()
+                        break
                     while len(pending) < self.max_active and not self.stop.is_set():
                         if self.native_runner and any(r['state'] in {'HELD', 'FAILED', 'CANCELLED'}
                                                       for r in self.queue.snapshot()['tasks']):
@@ -84,6 +89,7 @@ class Supervisor:
                                                  claim=claim, stop=self.stop, validators=self.validators,
                                                  timeout=min(30, claim['task']['budgets']['runtime_seconds']), behavior=behavior)
                         pending[future] = claim
+                        peak_submissions = max(peak_submissions, len(pending))
                     if not pending:
                         if self.native_runner:
                             # Review is serial and runs only after all workers stop:
@@ -96,6 +102,9 @@ class Supervisor:
                                 if self.stop.is_set():
                                     break
                                 if row['state'] == 'REVIEW':
+                                    if self.queue.integration_stopped():
+                                        self.stop.set()
+                                        break
                                     try:
                                         reviewed = self.native_runner.review(row['id'], self.stop)
                                     except Exception as error:
@@ -149,6 +158,14 @@ class Supervisor:
                 renewer.join(timeout=3)
             with self.queue.transaction() as db:
                 db.execute('DELETE FROM supervisor_lock WHERE owner=?', (self.owner,))
-        return {'outcomes': outcomes, 'queue': self.queue.snapshot(), 'mode': self.queue.evidence_mode,
+        snapshot = self.queue.snapshot()
+        elapsed = time.monotonic() - started
+        passed = sum(row['state'] == 'PASSED' for row in snapshot['tasks'])
+        metrics = {'elapsed_seconds': elapsed, 'peak_inflight_submissions': peak_submissions,
+                   'passed_tasks_at_exit': passed, 'queue_tasks': len(snapshot['tasks']),
+                   'scope': 'CONTROLLER_RUN_ONLY_NOT_MODEL_PROCESS_OVERLAP'}
+        with self.queue.transaction() as db:
+            self.queue._event(db, None, 'supervisor_metrics', owner=self.owner, **metrics)
+        return {'outcomes': outcomes, 'queue': snapshot, 'mode': self.queue.evidence_mode, 'metrics': metrics,
                 'native_dispatches': self.native_runner.dispatches if self.native_runner else 0,
                 'merge_executed': False}

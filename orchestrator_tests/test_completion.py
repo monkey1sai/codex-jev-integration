@@ -167,6 +167,156 @@ class Completion(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, 'ARTIFACT_DRIFT'):
             mock_attempt(self.queue, self.root, self.repo, validators=self.validators)
 
+    def integration_pair(self):
+        self.accepted()
+        self.execute(1)
+        self.queue.import_review(self.sign(self.queue.review_challenge('task-1')))
+        from orchestrator.merge_validation import prepare_integration
+        return prepare_integration(self.queue, self.root, self.repo, ['task-0', 'task-1'])
+
+    def test_reviewed_integration_restart_tree_and_registry_binding(self):
+        from orchestrator.merge_validation import verify_integration
+        prepared = self.integration_pair()
+        self.assertTrue(verify_integration(self.reopen(), prepared))
+        plan = self.validators.integration_plan(prepared)
+        self.assertEqual(len(plan['commands']), 1)  # Identical validator is not run twice.
+        self.assertEqual(plan['trusted_registry'], self.validators.sha256)
+        self.assertFalse(plan['execution_authorized'])
+        self.assertEqual(git(self.repo, 'rev-parse', 'HEAD'), self.base)
+        self.assertFalse((self.repo / 'result0.json').exists())
+        (Path(prepared['workspace']) / 'result0.json').write_bytes(b'tampered')
+        with self.assertRaisesRegex(ContractError, 'INTEGRATION_TREE_DRIFT'):
+            verify_integration(self.queue, prepared)
+
+    def test_integration_prepared_metadata_forgery_is_rejected(self):
+        from orchestrator.merge_validation import verify_integration
+        prepared = self.integration_pair()
+        prepared['baseline_hash'] = '0' * 64
+        with self.assertRaisesRegex(ContractError, 'INTEGRATION_PREPARED_DRIFT'):
+            verify_integration(self.queue, prepared)
+
+    def test_integration_without_review_and_with_duplicate_owners_is_rejected(self):
+        from orchestrator.merge_validation import prepare_integration
+        self.execute()
+        with self.assertRaisesRegex(ContractError, 'INTEGRATION_REVIEW_REQUIRED'):
+            prepare_integration(self.queue, self.root, self.repo, ['task-0'])
+        self.queue.import_review(self.sign(self.queue.review_challenge('task-0')))
+        other = self.task(1)
+        other['allowed_files'] = other['expected_artifacts'] = ['result0.json']
+        self.queue.enqueue([other])
+        mock_attempt(self.queue, self.root, self.repo, validators=self.validators)
+        self.queue.import_review(self.sign(self.queue.review_challenge('task-1')))
+        with self.assertRaisesRegex(ContractError, 'INTEGRATION_OWNERSHIP_CONFLICT'):
+            prepare_integration(self.queue, self.root, self.repo, ['task-0', 'task-1'])
+
+    def test_integration_native_failure_retains_unknown_capacity(self):
+        from orchestrator.development import NativeDevelopmentRunner
+        prepared = self.integration_pair()
+        runner = NativeDevelopmentRunner.__new__(NativeDevelopmentRunner)
+        runner.queue, runner.root, runner.repo = self.queue, self.root, self.repo
+        runner.validators = self.validators
+        runner._pins = self.queue._fresh
+        def failed(plan, command, workspace, folder, stop, processes):
+            processes.append({'role': 'unknown-test-process', 'execution': None})
+            raise ContractError('INJECTED_NATIVE_START_UNKNOWN')
+        runner._validator_command = failed
+        report = runner.integrate(['task-0', 'task-1'], threading.Event())
+        self.assertEqual(report['status'], 'BLOCKED')
+        self.assertFalse(report['process_tree_empty'])
+        self.assertFalse(report['merge_executed'])
+        self.assertIsNone(self.reopen().claim())
+        with self.reopen().transaction() as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM development_native_slots').fetchone()[0], 2)
+
+    def test_integration_cancel_before_native_launch_releases_reserved_slots(self):
+        from orchestrator.development import NativeDevelopmentRunner
+        self.integration_pair()
+        runner = NativeDevelopmentRunner.__new__(NativeDevelopmentRunner)
+        runner.queue, runner.root, runner.repo = self.queue, self.root, self.repo
+        runner._pins = self.queue._fresh
+        stop = threading.Event()
+        stop.set()
+        report = runner.integrate(['task-0', 'task-1'], stop)
+        self.assertEqual(report['status'], 'BLOCKED')
+        self.assertEqual(report['reason'], 'INTEGRATION_CANCELLED')
+        with self.queue.transaction() as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM development_native_slots').fetchone()[0], 0)
+
+    def test_integration_known_validator_failure_latches_stop_across_restart(self):
+        from orchestrator.development import NativeDevelopmentRunner
+        from test_development import clean_process
+        self.integration_pair()
+        self.queue.enqueue([self.task(2, ['task-0'])])
+        runner = NativeDevelopmentRunner.__new__(NativeDevelopmentRunner)
+        runner.queue, runner.root, runner.repo = self.queue, self.root, self.repo
+        runner.validators, runner._pins = self.validators, self.queue._fresh
+        def failed(plan, command, workspace, folder, stop, processes):
+            processes.append({'role': 'native-test-fixture', 'execution': clean_process()})
+            raise ContractError('INJECTED_VALIDATOR_FAILED')
+        runner._validator_command = failed
+        stop = threading.Event()
+        report = runner.integrate(['task-0', 'task-1'], stop)
+        self.assertEqual(report['status'], 'BLOCKED')
+        self.assertTrue(report['process_tree_empty'])
+        self.assertTrue(stop.is_set())
+        reopened = self.reopen()
+        self.assertEqual(reopened.snapshot()['tasks'][2]['state'], 'READY')
+        self.assertIsNone(reopened.claim(halt_on_failure=True))
+        self.assertIsNone(reopened.claim())
+        self.assertEqual(reopened.snapshot()['budget']['used'], 2)
+        with self.assertRaisesRegex(ContractError, 'INTEGRATION_FAILURE_STOP'):
+            runner.integrate(['task-0', 'task-1'], threading.Event())
+
+    def test_integration_allows_unchanged_expected_artifact_without_widening_scope(self):
+        from orchestrator.merge_validation import prepare_integration, verify_integration
+        (self.repo / '.gitattributes').write_bytes(b'result1.json -text\n')
+        (self.repo / 'result1.json').write_bytes(b'{"answer":42}\n')
+        git(self.repo, 'add', '--', '.gitattributes', 'result1.json')
+        git(self.repo, '-c', 'user.name=Test', '-c', 'user.email=test@localhost.invalid', 'commit', '-m', 'fixed baseline artifact')
+        self.base = git(self.repo, 'rev-parse', 'HEAD')
+        task = self.task()
+        task['allowed_files'] = task['expected_artifacts'] = ['result0.json', 'result1.json']
+        self.queue.enqueue([task])
+        mock_attempt(self.queue, self.root, self.repo, validators=self.validators)
+        self.queue.import_review(self.sign(self.queue.review_challenge('task-0')))
+        prepared = prepare_integration(self.queue, self.root, self.repo, ['task-0'])
+        self.assertEqual(len(prepared['batch']['files']), 2)
+        self.assertTrue(verify_integration(self.queue, prepared))
+        self.assertEqual((Path(prepared['workspace']) / 'result1.json').read_bytes(), b'{"answer":42}\n')
+
+    def test_failed_integration_pending_review_restart_cannot_consume_review_turn(self):
+        from orchestrator.development import NativeDevelopmentRunner
+        from test_development import clean_process
+        self.accepted()
+        self.execute(1)  # REVIEW, separate from the selected accepted batch.
+        runner = NativeDevelopmentRunner.__new__(NativeDevelopmentRunner)
+        runner.queue, runner.root, runner.repo = self.queue, self.root, self.repo
+        runner.validators, runner._pins = self.validators, self.queue._fresh
+        def failed(plan, command, workspace, folder, stop, processes):
+            processes.append({'role': 'fixture', 'execution': clean_process()})
+            raise ContractError('INJECTED_VALIDATOR_FAILED')
+        runner._validator_command = failed
+        self.assertEqual(runner.integrate(['task-0'], threading.Event())['status'], 'BLOCKED')
+        runner.queue = self.reopen()
+        runner.supervisor_owner, runner.config_hash = 'test-owner', 'test-config'
+        runner._settings, runner._argv = mock.Mock(return_value=({}, {})), mock.Mock(return_value=['OFFLINE_ONLY'])
+        runner._run = mock.Mock(side_effect=AssertionError('PROVIDER_MUST_NOT_LAUNCH'))
+        with runner.queue.transaction() as db:
+            db.execute('CREATE TABLE development_review_dispatch(task TEXT PRIMARY KEY, nonce TEXT UNIQUE, intent_hash TEXT)')
+            db.execute('CREATE TABLE supervisor_lock(id INTEGER PRIMARY KEY, owner TEXT, expires REAL)')
+            db.execute('INSERT INTO supervisor_lock VALUES(1,?,?)', ('test-owner', time.time() + 60))
+            row = db.execute("SELECT receipt FROM tasks WHERE id='task-1'").fetchone()
+            receipt = json.loads(row[0])
+            receipt['completion'] = {'native_thread_id': '00000000-0000-0000-0000-000000000001'}
+            db.execute("UPDATE tasks SET receipt=? WHERE id='task-1'", (canonical(receipt),))
+        result = runner.review('task-1', threading.Event())
+        self.assertEqual(result['reason'], 'INTEGRATION_FAILURE_STOP')
+        runner._run.assert_not_called()
+        with runner.queue.transaction() as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM development_review_dispatch').fetchone()[0], 0)
+            self.assertEqual(db.execute('SELECT count(*) FROM development_native_slots').fetchone()[0], 0)
+        self.assertEqual(runner.queue.snapshot()['budget']['used'], 2)
+
     def test_continuous_supervisor_dag_review_and_backpressure(self):
         self.queue.enqueue([self.task(), self.task(1, ['task-0']), self.task(2, ['task-0'])])
         supervisor = Supervisor(self.queue, self.root, self.repo, max_active=2, validators=self.validators)
@@ -192,6 +342,8 @@ class Completion(unittest.TestCase):
         self.assertEqual(failures, [])
         self.assertEqual([r['state'] for r in result['queue']['tasks']], ['PASSED'] * 3)
         self.assertEqual(result['native_dispatches'], 0)
+        self.assertEqual(result['metrics']['peak_inflight_submissions'], 2)
+        self.assertEqual(result['metrics']['scope'], 'CONTROLLER_RUN_ONLY_NOT_MODEL_PROCESS_OVERLAP')
         self.assertEqual(self.reopen().snapshot()['budget']['used'], 3)
 
     def test_supervisor_cancel_restart_and_expiry_keep_fences(self):

@@ -7,6 +7,7 @@ import hashlib
 import ast
 import json
 import os
+import shlex
 from pathlib import Path
 import threading
 import time
@@ -79,6 +80,49 @@ def tool_evidence(raw):
     if not items:
         raise ContractError('NO_REAL_TOOL_EXECUTION')
     return items
+
+
+def worker_checks_evidence(raw, commands):
+    """Native CLI command events, not worker prose or substring claims.
+
+    Intentionally accept only one literal command, optionally in the official
+    shell wrapper. Chaining, redirection, aliases and self-reported JSON fail.
+    Controller independently reruns every required validator afterwards.
+    """
+    observed, cutoff = [], -1
+    expected = [command['argv'] for command in commands]
+    for index, event in enumerate(jsonl_events(raw)):
+        item = event.get('item', {})
+        if event.get('type') != 'item.completed':
+            continue
+        if item.get('type') == 'file_change':
+            cutoff = index
+            continue
+        if item.get('type') != 'command_execution':
+            continue
+        cutoff_candidate = True
+        try:
+            argv = shlex.split(item['command'])
+            if len(argv) == 3 and argv[0] in {'/bin/bash', '/bin/sh', '/usr/bin/bash'} and argv[1] in {'-lc', '-c'}:
+                argv = shlex.split(argv[2])
+            if (argv in expected and item.get('status') == 'completed'
+                    and type(item.get('exit_code')) is int and item['exit_code'] == 0):
+                observed.append((argv, item.get('id'), index))
+                cutoff_candidate = False
+        except (ValueError, TypeError, KeyError):
+            pass
+        # Non-check commands may mutate files. They start a new candidate epoch;
+        # all checks must succeed after that epoch, even if the command looked readonly.
+        if cutoff_candidate:
+            cutoff = index
+    evidence = []
+    for command in commands:
+        matches = [item_id for argv, item_id, index in observed if index > cutoff and argv == command['argv']]
+        if not matches or any(not isinstance(item, str) for item in matches):
+            raise ContractError('WORKER_REQUIRED_CHECK_NOT_OBSERVED:' + command['validator'])
+        evidence.append({'validator': command['validator'], 'argv_hash': command['argv_hash'],
+                         'native_item_ids': matches, 'source': 'NATIVE_CLI_COMMAND_EVENTS'})
+    return evidence
 
 
 def typed_review(raw):
@@ -326,6 +370,7 @@ class NativeDevelopmentRunner:
         try:
             if stop.is_set() or not queue.start(claim):
                 raise ContractError('STALE_OR_CANCELLED_START')
+            required_checks = self.repo_adapter.authorize_task(claim['task']) if self.repo_adapter else []
             workspace, _ = allocate(self.root, self.repo, claim)
             (workspace / '.tmp').mkdir()
             snapshot = materialize(queue, claim, workspace)
@@ -339,18 +384,31 @@ class NativeDevelopmentRunner:
             baseline = self._scan(workspace, ignore_scratch=True)
             monitor = self._monitor_claim(claim, folder, local_stop, stop)
             settings, _ = self._settings(workspace, claim['task']['allowed_files'], claim['task']['execution'])
+            check_plan = self.validators.plan(claim, workspace, for_worker=True) if required_checks else None
+            worker_commands = [c for c in check_plan['commands'] if c['validator'] in required_checks] if check_plan else []
+            if set(required_checks) != {c['validator'] for c in worker_commands}:
+                raise ContractError('WORKER_CHECK_PLAN_INCOMPLETE')
             prompt = ('Complete this authorized development task using native tools. '
                       'Only edit allowed_files, including tests only when explicitly assigned. Do not spawn agents, change instructions/Git, '
                       'or access credentials, controller, other worktrees or network. '
-                      'The controller performs tests and independent review. '
+                      'The controller independently repeats validation and review. '
                       'Known ordinary tool/test errors may be corrected in this same turn only: '
                       'at most 3 failed tool events and 60 seconds from the first failure, within task timeout. '
                       'Never retry safety/permission denials or request a new attempt.\n' + canonical(claim['task']))
+            if worker_commands:
+                prompt += ('\nRead the relevant declarations and tsconfig before editing. Before finishing, run ALL '
+                           'following pinned checks yourself, after your final modifications. Use each exact literal command '
+                           'as a separate exec call, with no chaining, redirection or aliases. Fix ordinary failures within '
+                           'the same existing turn budget; do not install dependencies. Build output belongs only in .tmp. '
+                           'These checks must be your LAST tool calls: any later edit or non-check command invalidates them.\n'
+                           + '\n'.join(shlex.join(c['argv']) for c in worker_commands))
             argv = self._argv(workspace, settings, prompt=prompt)
             intent = {'mode': 'DEVELOPMENT', 'queue_id': queue.queue_id, 'claim': claim,
                       'argv': argv, 'config_hash': self.config_hash, 'pins': {str(p): h for p, h in self.pins.items()},
                       'settings': settings, 'baseline': baseline, 'challenge': uuid.uuid4().hex,
                       'worker_failure_policy': FAILURE_POLICY}
+            if check_plan:
+                intent['worker_check_plan'] = check_plan
             if self.repo_adapter:
                 intent['repo_adapter_hash'] = self.repo_adapter.hash
             frozen_bytes(folder / 'intent.json', canonical(intent).encode())
@@ -372,6 +430,7 @@ class NativeDevelopmentRunner:
             raw = (folder / 'worker.jsonl').read_bytes()
             completed = native_success(execution, raw)
             tools = tool_evidence(raw)
+            worker_checks = worker_checks_evidence(raw, worker_commands)
             self._pins()
             if stop.is_set() or local_stop.is_set() or not queue.validating(claim):
                 raise ContractError('STALE_NATIVE_RESULT')
@@ -390,6 +449,7 @@ class NativeDevelopmentRunner:
                             'evidence_kind': 'REAL_NATIVE_CLI_DEVELOPMENT',
                             'sandbox_boundary': 'TRUSTED_CODEX_NATIVE_POLICY',
                             'completion': completed, 'tool_evidence': tools,
+                            'worker_checks': worker_checks,
                             'configured_model': claim['task']['execution']['model'],
                             'configured_effort': claim['task']['execution']['reasoning_effort'],
                             'provider_attested_model': None,
@@ -445,40 +505,142 @@ class NativeDevelopmentRunner:
         for command in plan['commands']:
             if stop.is_set() or self.validators.plan(claim, workspace) != plan:
                 raise ContractError('VALIDATOR_PLAN_DRIFT_OR_CANCELLED')
-            settings, filesystem = self._settings(workspace, [], claim['task']['execution'], command['files'])
-            request = {'plan_hash': fingerprint(plan), 'workspace': str(workspace), 'command': command,
-                       'server_argv': self._argv(workspace, settings, server=True),
-                       'expected_filesystem': filesystem}
-            name = command['validator']
-            file = folder / (name + '-plan.json')
-            frozen_bytes(file, canonical(request).encode())
-            driver = Path(__file__).resolve().parents[1] / 'tools/development_validator.py'
-            argv = [str(Path('/usr/bin/python3').resolve()), '-I', '-B', str(driver), str(file)]
-            active = {'role': 'validator:' + name, 'execution': None}
-            processes.append(active)
-            execution = self._run(argv, folder, name, workspace, command['timeout_seconds'] + 15,
-                                  stop, lambda: self.queue.fence(claim, 'native_validator_stop'))
-            active['execution'] = execution
-            if not process_clean(execution) or execution.get('status') != 'EXITED' or execution.get('exit_code') != 0:
-                raise ContractError('NATIVE_VALIDATOR_FAILED')
-            raw = (folder / (name + '.jsonl')).read_bytes()
-            result = json.loads(raw)
-            if (result.get('status') != 'PASS' or result.get('local_fallback') is not False
-                    or result.get('plan_hash') != fingerprint(plan) or result['result']['exitCode'] != 0):
-                raise ContractError('NATIVE_VALIDATOR_EVIDENCE')
-            if name in self.expected_stdout and result['result'].get('stdout') != self.expected_stdout[name]:
-                raise ContractError('VALIDATOR_COMPLETION_MARKER_MISSING')
-            evidence.append({'validator': name, 'plan_hash': fingerprint(plan), 'native_rpc': 'command/exec',
-                             'result': result['result'], 'evidence_hash': digest(raw),
-                             'execution_hash': fingerprint(execution), 'local_fallback': False,
-                             'policy_hash': self.queue.policy['policy_hash']})
+            evidence.append(self._validator_command(plan, command, workspace, folder, stop, processes,
+                            lambda: self.queue.fence(claim, 'native_validator_stop'), role=claim['task']['execution']))
         return evidence
+
+    def _validator_command(self, plan, command, workspace, folder, stop, processes, before_terminate=None, *, role=None):
+        """Shared native-only path for attempt and reviewed integration checks."""
+        role = role or self.queue.policy['settings']['roles']['worker']
+        settings, filesystem = self._settings(workspace, [], role, command['files'])
+        request = {'plan_hash': fingerprint(plan), 'workspace': str(workspace), 'command': command,
+                   'server_argv': self._argv(workspace, settings, server=True), 'expected_filesystem': filesystem}
+        name = command['validator']
+        file = folder / (name + '-plan.json')
+        frozen_bytes(file, canonical(request).encode())
+        driver = Path(__file__).resolve().parents[1] / 'tools/development_validator.py'
+        argv = [str(Path('/usr/bin/python3').resolve()), '-I', '-B', str(driver), str(file)]
+        active = {'role': 'validator:' + name, 'execution': None}
+        processes.append(active)
+        execution = self._run(argv, folder, name, workspace, command['timeout_seconds'] + 15, stop, before_terminate)
+        active['execution'] = execution
+        if not process_clean(execution) or execution.get('status') != 'EXITED' or execution.get('exit_code') != 0:
+            raise ContractError('NATIVE_VALIDATOR_FAILED')
+        raw = (folder / (name + '.jsonl')).read_bytes()
+        result = json.loads(raw)
+        if (result.get('status') != 'PASS' or result.get('local_fallback') is not False
+                or result.get('plan_hash') != fingerprint(plan) or result['result']['exitCode'] != 0):
+            raise ContractError('NATIVE_VALIDATOR_EVIDENCE')
+        if name in self.expected_stdout and result['result'].get('stdout') != self.expected_stdout[name]:
+            raise ContractError('VALIDATOR_COMPLETION_MARKER_MISSING')
+        return {'validator': name, 'plan_hash': fingerprint(plan), 'native_rpc': 'command/exec',
+                'result': result['result'], 'evidence_hash': digest(raw),
+                'execution_hash': fingerprint(execution), 'local_fallback': False,
+                'policy_hash': self.queue.policy['policy_hash']}
+
+    def integrate(self, task_ids, stop):
+        """No provider or merge: validate a reviewed batch under native policy."""
+        from .merge_validation import reviewed_batch, prepare_integration, verify_integration
+        queue = self.queue
+        batch = reviewed_batch(queue, task_ids)
+        nonce = uuid.uuid4().hex
+        folder = queue.path.parent / 'integration-execution' / nonce
+        folder.mkdir(parents=True, exist_ok=False)
+        with queue.transaction() as db:
+            if db.execute('SELECT 1 FROM integration_failures LIMIT 1').fetchone():
+                raise ContractError('INTEGRATION_FAILURE_STOP')
+            if (db.execute("SELECT 1 FROM tasks WHERE state IN ('CLAIMED','RUNNING','VALIDATING','HELD') LIMIT 1").fetchone()
+                    or db.execute('SELECT 1 FROM development_native_slots LIMIT 1').fetchone()):
+                raise ContractError('INTEGRATION_CAPACITY')
+            # Reserve the whole configured capacity, including across restarts.
+            # An UNKNOWN process keeps these slots and cannot release DAG work.
+            for n in range(queue.policy['settings']['scheduler']['max_active']):
+                db.execute('INSERT INTO development_native_slots VALUES(?,?,?)',
+                           ('integration:' + nonce + ':' + str(n), task_ids[0], nonce))
+            queue._event(db, task_ids[0], 'integration_start', nonce=nonce, batch_hash=fingerprint(batch))
+        processes = []
+        report = {'status': 'BLOCKED', 'batch_hash': fingerprint(batch), 'nonce': nonce,
+                  'mode': queue.evidence_mode, 'merge_executed': False, 'human_authorization_required': True}
+        try:
+            self._pins()
+            if stop.is_set():
+                raise ContractError('INTEGRATION_CANCELLED')
+            prepared = prepare_integration(queue, self.root, self.repo, task_ids, repo_adapter=self.repo_adapter)
+            plan = self.validators.integration_plan(prepared)
+            report.update(prepared=prepared, validator_plan=plan, validators=[])
+            workspace = Path(prepared['workspace'])
+            for command in plan['commands']:
+                self._pins()
+                if stop.is_set() or self.validators.integration_plan(prepared) != plan:
+                    raise ContractError('INTEGRATION_PLAN_DRIFT_OR_CANCELLED')
+                report['validators'].append(self._validator_command(plan, command, workspace, folder, stop, processes))
+            self._pins()
+            verify_integration(queue, prepared)
+            if stop.is_set() or not attempt_cleanup_known(processes):
+                raise ContractError('INTEGRATION_CLEANUP_UNKNOWN_OR_CANCELLED')
+            report['status'] = 'PASS'
+        except Exception as error:
+            report['reason'] = str(error)
+            stop.set()
+        finally:
+            report['processes'] = processes
+            report['process_tree_empty'] = not processes or attempt_cleanup_known(processes)
+            frozen_bytes(folder / 'receipt.json', canonical(report).encode())
+            with queue.transaction() as db:
+                if report['status'] != 'PASS':
+                    db.execute('INSERT INTO integration_failures VALUES(?,?)', (nonce, fingerprint(report)))
+                if report['process_tree_empty']:
+                    db.execute('DELETE FROM development_native_slots WHERE nonce=?', (nonce,))
+                queue._event(db, task_ids[0], 'integration_result', nonce=nonce, status=report['status'],
+                             receipt_hash=fingerprint(report), process_tree_empty=report['process_tree_empty'])
+        return report
+
+    def parallel_evidence(self, task_ids):
+        """Observed real CLI process overlap; submission count is insufficient."""
+        from .merge_validation import reviewed_batch
+        self._pins()
+        if self.queue.evidence_mode != 'DEVELOPMENT':
+            raise ContractError('REAL_DEVELOPMENT_EVIDENCE_REQUIRED')
+        batch = reviewed_batch(self.queue, task_ids)
+        intervals, points = [], []
+        for binding in batch['bindings']:
+            folder = self.queue.path.parent / 'native-execution' / binding['attempt_id']
+            execution = json.loads(guarded(folder / 'worker-execution.json').read_bytes())
+            raw = guarded(folder / 'worker.jsonl').read_bytes()
+            receipt = json.loads(guarded(folder / 'receipt.json').read_bytes())
+            if (fingerprint(receipt) != binding['receipt_hash']
+                    or receipt.get('evidence_kind') != 'REAL_NATIVE_CLI_DEVELOPMENT'
+                    or fingerprint(execution) != receipt['execution_receipt_hash'] or digest(raw) != receipt['execution_hash']):
+                raise ContractError('PARALLEL_EXECUTION_CUSTODY_DRIFT')
+            native_success(execution, raw)
+            tool_evidence(raw)
+            start, end = execution.get('main_pid_observed_unix'), execution.get('launcher_exited_unix')
+            import math
+            if any(type(t) not in (int, float) or not math.isfinite(t) for t in (start, end)) or not 0 < start < end:
+                raise ContractError('PARALLEL_EXECUTION_TIME_UNKNOWN')
+            intervals.append({'task_id': binding['task_id'], 'attempt_id': binding['attempt_id'],
+                              'unit': execution['unit'], 'start_unix': start, 'end_unix': end})
+            points.extend([(start, 1), (end, -1)])
+        if len({i['unit'] for i in intervals}) != len(intervals):
+            raise ContractError('PARALLEL_EXECUTION_UNIT_REPLAY')
+        active, peak = 0, 0
+        for _, delta in sorted(points):
+            active += delta
+            peak = max(peak, active)
+        result = {'scope': 'CONTROLLER_OBSERVED_REAL_NATIVE_CLI_PROCESSES',
+                  'status': 'OVERLAP' if peak > 1 else 'SERIAL', 'peak_active': peak, 'intervals': intervals,
+                  'batch_hash': fingerprint(batch), 'policy_hash': self.queue.policy['policy_hash']}
+        frozen_bytes(self.queue.path.parent / 'parallel-evidence' / (fingerprint(result) + '.json'), canonical(result).encode())
+        return result
 
     def review(self, task_id, stop):
         queue = self.queue
         # Only this method can publish Development reviews, immediately after
         # controller launch/completion. No caller-supplied review receipt API.
         with queue.transaction() as db:
+            if db.execute('SELECT 1 FROM integration_failures LIMIT 1').fetchone():
+                stop.set()
+                return {'status': 'BLOCKED', 'reason': 'INTEGRATION_FAILURE_STOP', 'task_id': task_id}
             if db.execute('SELECT 1 FROM development_review_dispatch WHERE task=?', (task_id,)).fetchone():
                 return {'status': 'BLOCKED', 'reason': 'REVIEW_ALREADY_DISPATCHED_NO_RETRY', 'task_id': task_id}
         target = queue.review_challenge(task_id, ttl=600)
@@ -498,12 +660,21 @@ class NativeDevelopmentRunner:
             'findings': {'type': 'array', 'items': {'type': 'string'}}},
             'required': ['decision', 'findings'], 'additionalProperties': False}).encode())
         with queue.transaction() as db:
+            if db.execute('SELECT 1 FROM integration_failures LIMIT 1').fetchone():
+                stop.set()
+                return {'status': 'BLOCKED', 'reason': 'INTEGRATION_FAILURE_STOP', 'task_id': task_id}
             owner = db.execute('SELECT * FROM supervisor_lock').fetchone()
             if not owner or owner['owner'] != getattr(self, 'supervisor_owner', None) or owner['expires'] <= time.time():
                 return {'status': 'BLOCKED', 'reason': 'STALE_REVIEW_SUPERVISOR'}
             row = db.execute('SELECT contract,receipt FROM tasks WHERE id=?', (task_id,)).fetchone()
             task = json.loads(row['contract'])
+            if self.repo_adapter:
+                self.repo_adapter.authorize_task(task)
+                used = db.execute('SELECT count(*) FROM development_review_dispatch').fetchone()[0]
+                if used >= self.repo_adapter.review_budget:
+                    return {'status': 'BLOCKED', 'reason': 'REVIEW_CAMPAIGN_BUDGET'}
             validation = json.loads(row['receipt'])['validator_evidence']
+            worker_checks = json.loads(row['receipt']).get('worker_checks', [])
             worker_thread = json.loads(row['receipt'])['completion']['native_thread_id']
             if (db.execute("SELECT count(*) FROM tasks WHERE state IN ('CLAIMED','RUNNING','VALIDATING','HELD')").fetchone()[0]
                     or db.execute('SELECT count(*) FROM development_native_slots').fetchone()[0]):
@@ -519,6 +690,7 @@ class NativeDevelopmentRunner:
                   'Return JSON decision/findings.\nTask: ' + canonical(task) + '\nBinding: ' + canonical(target)
                   + '\nArtifact hashes: ' + canonical({k: before[k] for k in task['expected_artifacts']})
                   + '\nArtifact source: ' + canonical(bodies)
+                  + '\nWorker check command evidence: ' + canonical(worker_checks)
                   + '\nNative validation evidence: ' + canonical(validation))
         if self.repo_adapter:
             prompt += '\nBase-to-candidate diff and scope: ' + canonical(self.repo_adapter.review_context(workspace))

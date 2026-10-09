@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .contracts import ContractError, canonical, fingerprint, relative_file
 from .evidence import guarded, digest, frozen_bytes
-from .policy import load, safe_path
+from .policy import identifier, load, safe_path
 from .workspaces import scan, git
 
 MAX_BYTES = 256 * 1024 * 1024
@@ -29,7 +29,7 @@ class RepoAdapter:
         self.path = self.root / 'controller/repo-adapter.json'
         self.value, self.hash = load(self.path, max_bytes=2 * 1024 * 1024)
         v = self.value
-        if set(v) != {'mode', 'repo', 'source', 'base_sha', 'bundle_sha256', 'allowed_files',
+        if set(v) - {'campaign'} != {'mode', 'repo', 'source', 'base_sha', 'bundle_sha256', 'allowed_files',
                       'node', 'node_sha256', 'dependencies', 'dependency_hashes', 'protected_hashes'}:
             raise ContractError('REPO_ADAPTER_SCHEMA')
         self.repo = guarded(v['repo'])
@@ -45,6 +45,34 @@ class RepoAdapter:
             relative_file(name)
             if name.split('/')[0] not in {'src', 'scripts', 'tests'} or name in v['protected_hashes']:
                 raise ContractError('REPO_ADAPTER_FILES')
+        self.campaign = v.get('campaign')
+        if self.campaign is not None:
+            c = self.campaign
+            if type(c) is not dict or set(c) != {'campaign_id', 'max_active', 'worker_budget', 'review_budget', 'tasks'}:
+                raise ContractError('REPO_CAMPAIGN_SCHEMA')
+            identifier(c['campaign_id'])
+            if (c['campaign_id'] != self.root.name or type(c['tasks']) is not dict
+                    or not 1 <= len(c['tasks']) <= 38
+                    or type(c['worker_budget']) is not int or c['worker_budget'] != len(c['tasks'])
+                    or type(c['review_budget']) is not int or not 1 <= c['review_budget'] <= c['worker_budget']
+                    or type(c['max_active']) is not int or not 1 <= c['max_active'] <= 2):
+                raise ContractError('REPO_CAMPAIGN_LIMIT')
+            for task_id, entry in c['tasks'].items():
+                identifier(task_id)
+                if (type(entry) is not dict or set(entry) != {'task_hash', 'allowed_files', 'validators', 'worker_checks'}
+                        or not isinstance(entry['task_hash'], str) or len(entry['task_hash']) != 64
+                        or any(ch not in '0123456789abcdef' for ch in entry['task_hash'])):
+                    raise ContractError('REPO_CAMPAIGN_TASK')
+                for field in ('allowed_files', 'validators', 'worker_checks'):
+                    if (type(entry[field]) is not list or not entry[field] or len(entry[field]) > 64
+                            or any(not isinstance(item, str) for item in entry[field])
+                            or len(set(entry[field])) != len(entry[field])):
+                        raise ContractError('REPO_CAMPAIGN_TASK')
+                if (not set(entry['allowed_files']) <= set(v['allowed_files'])
+                        or not set(entry['worker_checks']) <= set(entry['validators'])):
+                    raise ContractError('REPO_CAMPAIGN_TASK')
+                for name in entry['validators']:
+                    identifier(name)
         self.verify()
         if git(self.repo, 'rev-parse', 'HEAD') != v['base_sha']:
             raise ContractError('REPO_ADAPTER_BASE')
@@ -65,15 +93,35 @@ class RepoAdapter:
                 raise ContractError('REPO_CONFIG_DRIFT')
 
     def bind(self, queue, root, repo):
+        expected_dispatches = self.campaign['worker_budget'] if self.campaign else 1
         if (root != self.root or repo != self.repo or queue.evidence_mode != 'DEVELOPMENT'
                 or queue.policy['settings']['routing']['jev_enabled']
-                or queue.policy['settings']['scheduler']['max_dispatches'] != 1):
+                or queue.policy['settings']['scheduler']['max_dispatches'] != expected_dispatches
+                or (self.campaign and (queue.policy['settings']['scheduler']['max_active'] > self.campaign['max_active']
+                                       or queue.policy['settings']['scheduler']['max_attempts'] != 1))):
             raise ContractError('REPO_ADAPTER_BINDING')
         with queue.transaction() as db:
             db.execute('CREATE TABLE IF NOT EXISTS repo_adapter_binding(id INTEGER PRIMARY KEY CHECK(id=1), hash TEXT)')
             db.execute('INSERT OR IGNORE INTO repo_adapter_binding VALUES(1,?)', (self.hash,))
             if db.execute('SELECT hash FROM repo_adapter_binding').fetchone()[0] != self.hash:
                 raise ContractError('REPO_ADAPTER_RESTART_DRIFT')
+
+    def authorize_task(self, task):
+        """Pinned controller contract, not a grant to exceed repo/runtime ceilings."""
+        self.verify()
+        if not self.campaign:
+            return []  # Preserve the legacy single-task contract and evidence.
+        entry = self.campaign['tasks'].get(task['task_id'])
+        if (not entry or entry['task_hash'] != fingerprint(task)
+                or task['base_sha'] != self.value['base_sha']
+                or task['allowed_files'] != entry['allowed_files'] or task['tests'] != entry['validators']
+                or task['budgets']['attempts'] != 1):
+            raise ContractError('REPO_CAMPAIGN_CONTRACT_DRIFT')
+        return entry['worker_checks']
+
+    @property
+    def review_budget(self):
+        return self.campaign['review_budget'] if self.campaign else 1
 
     def prepare(self, workspace):
         self.verify()

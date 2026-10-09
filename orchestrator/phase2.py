@@ -40,6 +40,8 @@ class Phase2Queue(CoreQueue):
             db.execute('CREATE TABLE IF NOT EXISTS reviews(task TEXT PRIMARY KEY, envelope TEXT, hash TEXT, source TEXT)')
             db.execute('CREATE TABLE IF NOT EXISTS review_runtime(nonce TEXT PRIMARY KEY, hash TEXT UNIQUE, receipt TEXT)')
             db.execute('CREATE TABLE IF NOT EXISTS development_native_slots(actor TEXT PRIMARY KEY, task TEXT, nonce TEXT)')
+            db.execute('CREATE TABLE IF NOT EXISTS scheduler_decision(id INTEGER PRIMARY KEY CHECK(id=1), hash TEXT)')
+            db.execute('CREATE TABLE IF NOT EXISTS integration_failures(nonce TEXT PRIMARY KEY, receipt_hash TEXT)')
         from .evidence import ReviewTrust, ArtifactStore
         self.trust = ReviewTrust(review_registry, registry_sha256, self.path.parent / 'review-verification', self.repo) if review_registry else None
         if bool(review_registry) != bool(registry_sha256):
@@ -84,6 +86,10 @@ class Phase2Queue(CoreQueue):
                 db.execute("UPDATE tasks SET state='READY' WHERE id=?", (row['id'],))
                 self._event(db, row['id'], 'READY')
 
+    def integration_stopped(self):
+        with self.transaction() as db:
+            return db.execute('SELECT 1 FROM integration_failures LIMIT 1').fetchone() is not None
+
     def claim(self, lease_seconds=180, now=None, *, capabilities=None, halt_on_failure=False):
         self._fresh()
         if type(halt_on_failure) is not bool:
@@ -92,24 +98,67 @@ class Phase2Queue(CoreQueue):
             raise ContractError('LEASE_BOUND')
         now = time.time() if now is None else now
         with self.transaction() as db:
+            decision = {'policy_hash': self.policy['policy_hash'], 'selected': None, 'candidates': []}
+            def audit(reason):
+                decision['reason'] = reason
+                sha = fingerprint(decision)
+                previous = db.execute('SELECT hash FROM scheduler_decision WHERE id=1').fetchone()
+                if not previous or previous[0] != sha:
+                    db.execute('INSERT OR REPLACE INTO scheduler_decision VALUES(1,?)', (sha,))
+                    self._event(db, decision['selected'] or '__scheduler__', 'dispatch_decision', **decision)
+            if db.execute('SELECT 1 FROM integration_failures LIMIT 1').fetchone():
+                audit('INTEGRATION_FAILURE_STOP')
+                return None
             if halt_on_failure and db.execute("SELECT 1 FROM tasks WHERE state IN ('HELD','FAILED','CANCELLED') LIMIT 1").fetchone():
+                audit('FAILURE_STOP')
                 return None
             self._ready(db)
             cap = db.execute('SELECT active_cap FROM controller_binding').fetchone()[0]
             active = db.execute("SELECT count(*) FROM tasks WHERE state IN ('CLAIMED','RUNNING','VALIDATING','HELD')").fetchone()[0]
             active += db.execute('SELECT count(*) FROM development_native_slots').fetchone()[0]
             budget = db.execute('SELECT * FROM budget').fetchone()
+            decision.update(active=active, active_cap=cap, dispatches_used=budget['used'],
+                            dispatches_limit=budget['max_dispatches'])
             if active >= cap or budget['used'] >= budget['max_dispatches']:
+                audit('ACTIVE_CAP' if active >= cap else 'DISPATCH_BUDGET')
                 return None
-            for row in db.execute("SELECT * FROM tasks WHERE state='READY' ORDER BY rowid").fetchall():
+            limits = self.policy['settings']['scheduler'].get('resource_limits', {})
+            usage = {name: 0 for name in limits}
+            # HELD remains charged until positive process-tree cleanup evidence.
+            busy = db.execute("SELECT contract FROM tasks WHERE state IN ('CLAIMED','RUNNING','VALIDATING','HELD')").fetchall()
+            busy += db.execute('SELECT t.contract FROM tasks t JOIN development_native_slots s ON t.id=s.task').fetchall()
+            caps = self.policy['settings']['capabilities']
+            for record in busy:
+                costs = caps[json.loads(record['contract'])['capability']].get('resources', {})
+                for name, units in costs.items():
+                    usage[name] += units
+            decision.update(resource_usage=usage, resource_limits=limits)
+            locks = {r[0] for r in db.execute('SELECT resource FROM locks')}
+            rows = db.execute("SELECT * FROM tasks WHERE state='READY' ORDER BY rowid").fetchall()
+            # Stable sorting preserves insertion order for equal/default priorities.
+            rows.sort(key=lambda row: -json.loads(row['contract']).get('priority', 0))
+            for row in rows:
                 task = json.loads(row['contract'])
+                candidate = {'task_id': row['id'], 'priority': task.get('priority', 0), 'reason': 'ELIGIBLE'}
+                decision['candidates'].append(candidate)
                 if capabilities is not None and task['capability'] not in capabilities:
+                    candidate['reason'] = 'CAPABILITY'
                     continue
                 if row['attempts'] >= task['budgets']['attempts'] or row['provider_unknown']:
+                    candidate['reason'] = 'ATTEMPT_BUDGET_OR_PROVIDER_UNKNOWN'
                     continue
                 resources = sorted(set(task['resource_locks'] + ['file:' + p.casefold() for p in task['allowed_files']]))
-                if any(db.execute('SELECT 1 FROM locks WHERE resource=?', (r,)).fetchone() for r in resources):
+                if any(r in locks or (r.startswith('file:') and any(
+                       held.startswith('file:') and (r.startswith(held + '/') or held.startswith(r + '/'))
+                       for held in locks)) for r in resources):
+                    candidate['reason'] = 'OWNERSHIP_OR_RESOURCE_LOCK'
                     continue
+                costs = caps[task['capability']].get('resources', {})
+                if any(usage[name] + units > limits[name] for name, units in costs.items()):
+                    candidate['reason'] = 'RESOURCE_QUOTA'
+                    continue
+                decision['selected'] = row['id']
+                audit('SELECTED')
                 token, epoch = uuid.uuid4().hex, row['epoch'] + 1
                 db.execute("UPDATE tasks SET state='CLAIMED',epoch=?,attempts=attempts+1,attempt_id=?,expires=? WHERE id=?",
                            (epoch, token, now + lease_seconds, row['id']))
@@ -117,6 +166,7 @@ class Phase2Queue(CoreQueue):
                 db.execute('UPDATE budget SET used=used+1 WHERE id=1')
                 self._event(db, row['id'], 'CLAIMED', epoch=epoch, attempt_id=token)
                 return {'task': task, 'task_hash': row['hash'], 'attempt_id': token, 'epoch': epoch}
+            audit('NO_ELIGIBLE_TASK')
         return None
 
     def _transition(self, claim, before, after, now=None):
