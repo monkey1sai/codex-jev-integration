@@ -39,7 +39,16 @@ def open_campaign(root, runtime):
     adapter = RepoAdapter(root)
     session, _ = load(root / 'controller/session.json')
     tasks, tasks_hash = load(root / 'controller/tasks.json', max_bytes=2 * 1024 * 1024)
-    queue = Phase2Queue(root / 'controller/queue.sqlite', adapter.repo, session=session, evidence_mode='DEVELOPMENT')
+    isolation_path = root / 'controller/failure-isolation.json'
+    isolation = {'mode': 'legacy_campaign', 'version': 1}
+    if isolation_path.exists():
+        isolation, _ = load(isolation_path)
+        if (type(isolation) is not dict or set(isolation) != {'mode', 'version'}
+                or isolation['mode'] != 'independent_tasks_v1'
+                or type(isolation['version']) is not int or isolation['version'] != 1):
+            raise ContractError('FAILURE_ISOLATION_SCHEMA')
+    queue = Phase2Queue(root / 'controller/queue.sqlite', adapter.repo, session=session, evidence_mode='DEVELOPMENT',
+                        failure_isolation=isolation['mode'])
     check_contracts(queue, adapter, tasks)
     path = root / 'controller/validator-registry.json'
     registry = ValidatorRegistry(queue, path, digest(path.read_bytes()))
@@ -53,6 +62,7 @@ def open_campaign(root, runtime):
     binding = {'campaign_id': root.name, 'adapter_hash': adapter.hash, 'tasks_hash': tasks_hash,
                'policy_hash': queue.policy['policy_hash'], 'registry_hash': registry.sha256,
                'expectations_hash': expectations_hash,
+               'failure_isolation_hash': queue.failure_isolation_hash,
                'native_config_hash': runner.config_hash}
     return queue, adapter, tasks, runner, binding
 

@@ -78,7 +78,9 @@ class Supervisor:
                                                       for r in self.queue.snapshot()['tasks']):
                             if not self.queue.failures_are_isolated():
                                 self.stop.set()
-                            break
+                                break
+                            if not self.queue.independent_failures:
+                                break
                         claim = self.queue.claim(lease_seconds=60, capabilities=self.capabilities,
                                                  halt_on_failure=self.native_runner is not None)
                         if claim is None:
@@ -96,7 +98,8 @@ class Supervisor:
                             # Review is serial and runs only after all workers stop:
                             # reviewer processes count toward the same capacity.
                             rows = self.queue.snapshot()['tasks']
-                            if any(r['state'] in {'HELD', 'FAILED', 'CANCELLED'} for r in rows):
+                            if (any(r['state'] in {'HELD', 'FAILED', 'CANCELLED'} for r in rows)
+                                    and not (self.queue.independent_failures and self.queue.failures_are_isolated())):
                                 self.stop.set()
                                 break
                             for row in rows:
@@ -112,15 +115,23 @@ class Supervisor:
                                         reviewed = {'status': 'BLOCKED', 'task_id': row['id'], 'reason': type(error).__name__}
                                     outcomes.append(reviewed)
                                     if not isinstance(reviewed, dict) or reviewed.get('status') != 'PASSED':
+                                        if (self.queue.independent_failures and isinstance(reviewed, dict)
+                                                and reviewed.get('failure_scope') == 'TASK'
+                                                and self.queue.failures_are_isolated()):
+                                            continue
                                         self.stop.set()
                                         break
                             if self.stop.is_set():
                                 break
                             rows = self.queue.snapshot()['tasks']
-                            if any(r['state'] in {'REVIEW', 'HELD', 'FAILED', 'CANCELLED'} for r in rows):
+                            if any(r['state'] in {'REVIEW', 'HELD', 'CANCELLED'} for r in rows):
                                 break
                             if any(r['state'] == 'READY' for r in rows):
                                 continue
+                            if self.queue.independent_failures:
+                                # Remaining PENDING branches have failed ancestors, or no
+                                # dispatch budget. No external review can make them ready.
+                                break
                         # External reviews can make child tasks READY while polling.
                         rows = self.queue.snapshot()['tasks']
                         if all(r['state'] in {'PASSED', 'FAILED', 'CANCELLED'} for r in rows):

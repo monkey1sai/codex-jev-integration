@@ -4,7 +4,7 @@ import re
 import shlex
 import threading
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .contracts import ContractError, canonical, fingerprint
 from .evidence import digest, frozen_bytes, guarded
@@ -12,6 +12,77 @@ from .evidence import digest, frozen_bytes, guarded
 LEGACY_POLICY = {'version': 1, 'max_recoverable_failures': 3, 'recovery_seconds': 60,
           'new_dispatch_retries': 0, 'unknown': 'STOP'}
 POLICY = {**LEGACY_POLICY, 'version': 2}
+INDEPENDENT_POLICY = {**POLICY, 'version': 3}
+
+
+def public_repo_name(name):
+    """Public repo inventory only; neither a read nor a write permission grant."""
+    if not isinstance(name, str) or '\\' in name or ':' in name:
+        return False
+    parts = PurePosixPath(name).parts
+    return (bool(parts) and not name.startswith('/') and name == '/'.join(parts)
+            and not any(p.startswith('.') or p.casefold() in {'node_modules', 'controller', 'runtime-home', 'credentials'} for p in parts)
+            and not any(p.casefold() in {'auth.json', 'credentials.json'} or p.casefold().endswith(('.env', '.pem', '.key')) for p in parts))
+
+
+class RepoReadContext:
+    """Controller-created context for the narrow native cat/ENOENT case.
+
+    Host metadata corroborates the missing leaf. Native-trust Development only;
+    this is not a claim of live namespace attestation. Stdout grants no authority.
+    """
+    def __init__(self, workspace, files, tools, receipt_hash):
+        self.workspace = guarded(workspace).resolve(strict=True)
+        self.files = dict(files)
+        self.cat = dict(tools.get('cat', {}))
+        self.parents = {str(PurePosixPath(name).parent) for name in files}
+        self.binding = {'workspace': str(self.workspace), 'files_hash': fingerprint(files),
+                        'cat': self.cat, 'task_context_hash': receipt_hash}
+
+    def missing_read(self, command, output):
+        if not isinstance(command, str) or len(command) > 4096:
+            return False
+        argv = literal_argv(command)
+        # No expansions/operators/flags/interpreters, even if quoted text looks safe.
+        if (not argv or any(c in command for c in '\n\r$`;&|<>()*?[]{}~')
+                or self.cat.get('status') != 'AVAILABLE'
+                or argv[0] != self.cat.get('path')):
+            return False
+        names = argv[1:]
+        if names and names[0] == '--':
+            names = names[1:]
+        if len(names) != 1:
+            return False
+        try:
+            executable = guarded(self.cat['path'])
+            if digest(executable.read_bytes()) != self.cat['sha256']:
+                return False
+            for name in names:
+                # CLI command_execution does not bind each tool's cwd. Absolute
+                # paths make resolution independent of a worker-selected cwd.
+                operand = Path(name)
+                if not operand.is_absolute():
+                    return False
+                relative = operand.relative_to(self.workspace).as_posix()
+                if (not re.fullmatch(r'[\w./:-]+', name)
+                        or not public_repo_name(relative)
+                        or name != self.workspace.as_posix() + '/' + relative
+                        or str(PurePosixPath(relative).parent) not in self.parents):
+                    return False
+                path = guarded(operand)
+                if not path.resolve().is_relative_to(self.workspace) or not path.parent.is_dir():
+                    return False
+                try:
+                    path.stat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    return False
+            # No mixed EIO/unknown diagnostic or data-bearing second operand.
+            return output in {'cat: ' + names[0] + ': No such file or directory\n',
+                              "cat: '" + names[0] + "': No such file or directory\n"}
+        except (OSError, ContractError, KeyError, ValueError):
+            return False
 
 
 def literal_argv(command):
@@ -31,7 +102,7 @@ ORDINARY = re.compile(r'command not found|(?:Assertion|Syntax|Indentation|Module
                       r'(?:^|\n)FAILED \(|={2,} FAILURES ={2,}|\b\d+ failed\b|\berror (?:TS|CS)\d+', re.I)
 
 
-def classify(event):
+def classify(event, *, read_context=None):
     """Only pinned CLI envelopes are input. Tool stdout supplies no authority."""
     if type(event) is not dict or not isinstance(event.get('type'), str):
         return 'PROTOCOL_UNKNOWN', 'STOP'
@@ -62,6 +133,10 @@ def classify(event):
     status, code = item.get('status'), item.get('exit_code')
     if status == 'completed' and (tool == 'file_change' or type(code) is int and code == 0):
         return None
+    if (tool == 'command_execution' and status == 'failed' and type(code) is int and code == 1
+            and isinstance(read_context, RepoReadContext)
+            and read_context.missing_read(item.get('command'), text)):
+        return 'REPO_READ_ENOENT', 'RECOVER'
     if (tool == 'command_execution' and status == 'failed' and type(code) is int
             and code in {1, 2, 127} and ORDINARY.search(text)):
         return 'ORDINARY_TOOL_OR_TEST_FAILURE', 'RECOVER'
@@ -69,10 +144,10 @@ def classify(event):
 
 
 class WorkerFailureMonitor:
-    def __init__(self, folder, binding, runtime_seconds, on_stop, *, policy=None, checks=(), clock=time.monotonic):
+    def __init__(self, folder, binding, runtime_seconds, on_stop, *, policy=None, checks=(), read_context=None, clock=time.monotonic):
         self.folder, self.binding = guarded(folder), dict(binding)
         self.policy = dict(POLICY if policy is None else policy)
-        if (set(self.policy) != set(POLICY) or type(self.policy['version']) is not int or self.policy['version'] not in {1, 2}
+        if (set(self.policy) != set(POLICY) or type(self.policy['version']) is not int or self.policy['version'] not in {1, 2, 3}
                 or type(self.policy['max_recoverable_failures']) is not int
                 or not 0 <= self.policy['max_recoverable_failures'] <= POLICY['max_recoverable_failures']
                 or type(self.policy['recovery_seconds']) not in (int, float)
@@ -96,15 +171,34 @@ class WorkerFailureMonitor:
             self.checks[argv] = seconds
         self.buffer, self.total, self.count, self.sequence = b'', 0, 0, 0
         self.completed, self.stopped, self.reason = False, False, None
+        self.task_failure = None
+        self.read_context = read_context if self.policy['version'] == 3 else None
         self.control_unknown = False
         self.seen = set()
         self.config = {'binding': self.binding, 'policy': self.policy,
                        'runtime_seconds': runtime_seconds, 'started_unix': time.time()}
-        if self.policy['version'] == 2:
+        if self.policy['version'] >= 2:
             self.config['checks'] = [{'argv': list(a), 'timeout_seconds': s} for a, s in self.checks.items()]
+        if self.policy['version'] == 3:
+            self.config['read_context'] = self.read_context.binding if self.read_context else None
         self.last_hash = fingerprint(self.config)
         # Exclusive creation rejects parser/attempt replay; recovery is audit-only.
         frozen_bytes(self.folder / 'policy.json', canonical(self.config).encode())
+
+    def bind_read_context(self, context):
+        """One controller-only binding after the bounded pre-dispatch tool probe."""
+        with self.lock:
+            if (self.policy['version'] != 3 or self.total or self.sequence or self.read_context
+                    or self.stopped or self.completed or not isinstance(context, RepoReadContext)):
+                raise ContractError('READ_CONTEXT_REPLAY_OR_STALE')
+            frozen_bytes(self.folder / 'read-context.json', canonical(context.binding).encode())
+            self.read_context = context
+            try:
+                self._record('READ_CONTEXT_BOUND', 'OBSERVE')
+            except Exception:
+                self.control_unknown = True
+                self.stop('EVIDENCE_UNKNOWN')
+                raise
 
     def _record(self, category, action, raw=b''):
         self.sequence += 1
@@ -114,10 +208,12 @@ class WorkerFailureMonitor:
                  'category': category, 'action': action, 'recoverable_failures': self.count,
                  'recovery_deadline_elapsed': None if self.recovery_deadline is None else self.recovery_deadline - self.start,
                  'raw_event_sha256': digest(raw) if raw else None}
-        if self.policy['version'] == 2:
+        if self.policy['version'] >= 2:
             value.update(repair_seconds_remaining=self.repair_remaining,
                          unresolved_commands_hash=fingerprint(sorted(self.unresolved)),
                          active_check=self.active_check)
+        if self.policy['version'] == 3:
+            value['read_context_hash'] = fingerprint(self.read_context.binding) if self.read_context else None
         frozen_bytes(self.folder / ('%06d.json' % self.sequence), canonical(value).encode())
         self.last_hash = fingerprint(value)
 
@@ -152,7 +248,7 @@ class WorkerFailureMonitor:
 
     def _check_lifecycle(self, event, raw):
         """Only pinned command lifecycle can pause repair accounting, never prose."""
-        if self.policy['version'] != 2 or not event['type'].startswith('item.'):
+        if self.policy['version'] < 2 or not event['type'].startswith('item.'):
             return
         item = event['item']
         if event['type'] == 'item.completed' and item['type'] == 'file_change':
@@ -238,7 +334,7 @@ class WorkerFailureMonitor:
                 if self.completed:
                     self.stop('EVENT_AFTER_COMPLETION', raw)
                     break
-                decision = classify(event)
+                decision = classify(event, read_context=self.read_context)
                 if decision and decision[1] == 'STOP':
                     self.stop(decision[0], raw)
                     break
@@ -258,7 +354,7 @@ class WorkerFailureMonitor:
                     break
                 if decision:
                     self.count += 1
-                    if self.policy['version'] == 2:
+                    if self.policy['version'] >= 2:
                         argv = literal_argv(event['item'].get('command'))
                         if not argv:
                             self.stop('RECOVERY_COMMAND_UNKNOWN', raw)
@@ -279,8 +375,17 @@ class WorkerFailureMonitor:
                     self.tick()
                     if self.active_check:
                         self.stop('CHECK_LIFECYCLE_UNKNOWN', raw)
-                    if self.policy['version'] == 2 and self.unresolved and not self.stopped:
-                        self.stop('UNRESOLVED_TOOL_FAILURE', raw)
+                    if self.policy['version'] >= 2 and self.unresolved and not self.stopped:
+                        if self.policy['version'] == 3:
+                            self.task_failure = 'UNRESOLVED_TOOL_FAILURE'
+                            try:
+                                self._record(self.task_failure, 'TASK_REJECT', raw)
+                            except Exception:
+                                self.control_unknown = True
+                                self.stop('EVIDENCE_UNKNOWN', raw)
+                                raise
+                        else:
+                            self.stop('UNRESOLVED_TOOL_FAILURE', raw)
                     if not self.stopped:
                         self.completed = True
             if len(self.buffer) > 65536 and not self.stopped:
@@ -299,6 +404,7 @@ class WorkerFailureMonitor:
                     'recoverable_failures': self.count, 'stopped': self.stopped, 'reason': self.reason,
                     'control_unknown': self.control_unknown,
                     'completion_observed': self.completed, 'last_record_hash': self.last_hash,
+                    'task_failure': self.task_failure,
                     'unresolved_commands': [list(a) for a in sorted(self.unresolved)],
                     'task_seconds_remaining': max(0, self.deadline - self.clock())}
 
@@ -310,6 +416,7 @@ def audit_failure_log(folder, binding):
     if config['binding'] != binding:
         raise ContractError('FAILURE_EVIDENCE_BINDING')
     previous, rows = fingerprint(config), []
+    context = config.get('read_context')
     for index, path in enumerate(sorted(folder.glob('[0-9]*.json')), 1):
         value = json.loads(path.read_bytes())
         if (path.name != '%06d.json' % index or value['sequence'] != index
@@ -317,6 +424,15 @@ def audit_failure_log(folder, binding):
                 or value['failure_policy_hash'] != fingerprint(config['policy'])
                 or value['previous_hash'] != previous):
             raise ContractError('FAILURE_EVIDENCE_DRIFT')
+        if config['policy']['version'] == 3:
+            if value['category'] == 'READ_CONTEXT_BOUND':
+                if index != 1 or context is not None:
+                    raise ContractError('READ_CONTEXT_REPLAY_OR_STALE')
+                context = json.loads((folder / 'read-context.json').read_bytes())
+            if value.get('read_context_hash') != (fingerprint(context) if context else None):
+                raise ContractError('READ_CONTEXT_DRIFT')
         previous = fingerprint(value)
         rows.append(value)
+    if config['policy']['version'] == 3 and (folder / 'read-context.json').exists() and context is None:
+        raise ContractError('READ_CONTEXT_ORPHAN')
     return {'records': rows, 'last_record_hash': previous, 'execution_resumed': False}

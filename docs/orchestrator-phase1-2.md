@@ -1185,3 +1185,21 @@ Global/Repo capacity、原生 safety、歷史 attempts 不變；Worker/Review tu
 冷重啟未補額度／重派工；110 evidence hashes 一致，346 regression PASS。
 原 Repo/Global/safety/capacity 不變，無 push/PR/merge。詳見
 [實際失敗、清理與最小下一步](game-parallel-campaign-02.md)。
+
+## Parallel Worker 分支故障隔離 — 零 Provider 增量
+
+基準 `8e683285`。延伸既有 Runner／Queue／Supervisor，明確新增 fresh Development
+`independent_tasks_v1` binding：v3 可信窄 ENOENT 修復、實際檔案／工具／pinned checks Task Context、
+已知完成且 clean 的普通 Task／Validator／typed Review failure 局部隔離。
+健康獨立任務可依原預算完成派工與 Review，自己的 PASSED 下游可接續；失敗依賴不執行，
+Campaign 與成功 subset 整合仍受阻。legacy／歷史 FAIL 不重新解釋。
+
+相對 tool cwd 無可信綁定，因此只接受 pinned absolute cat＋單一 canonical absolute Repo 缺失 leaf＋
+完整精確 ENOENT；relative／多 operands／混合 EIO 仍 UNKNOWN。未知 Review／crash 後的
+durable intent 阻擋重啟派工，cleanup 不冒充已知 Provider verdict。
+獨立 architecture／security finding 已修正並覆核 accept，僅為 source advisory review。
+
+原 257 Orchestrator 保留，加 24 項因果測試；**281 + 77 Jev + 12 Inventory = 370 regression PASS**。
+本輪 Worker／Review turns 均 0，真實新版 recovery／雙 Worker 遊戲交付 **NOT_RUN**，整體仍 PARTIAL。
+Global production／原 Repo／Sandbox／Review／容量與人工 Merge 邊界不變，無 push／PR／merge／Jev。
+詳見 [Failure Matrix、實際測試及下一次有界提案](parallel-worker-isolation.md)。

@@ -21,7 +21,8 @@ from .processes import jsonl_events
 from .pipeline import artifact_manifest
 from .snapshots import materialize
 from .workspaces import allocate, scan, git
-from .worker_failures import WorkerFailureMonitor, POLICY as FAILURE_POLICY, classify
+from .worker_failures import (WorkerFailureMonitor, POLICY as FAILURE_POLICY, INDEPENDENT_POLICY,
+                              RepoReadContext, public_repo_name, classify)
 
 
 class OrdinaryValidationFailure(ContractError):
@@ -29,6 +30,29 @@ class OrdinaryValidationFailure(ContractError):
     def __init__(self, reason, evidence):
         super().__init__(reason)
         self.evidence = evidence
+
+
+class CompletedTaskFailure(OrdinaryValidationFailure):
+    """Known complete turn, failed ordinary acceptance; never a native stop."""
+
+
+def task_context(queue, claim, baseline, placeholders, readiness, commands, *, workspace=None):
+    files = {name: baseline[name] for name in sorted(baseline) if public_repo_name(name)}
+    value = {'version': 1, 'queue_id': queue.queue_id, 'task_hash': claim['task_hash'],
+             'attempt_id': claim['attempt_id'], 'epoch': claim['epoch'],
+             'policy_hash': queue.policy['policy_hash'], 'failure_isolation_hash': queue.failure_isolation_hash,
+             'base_sha': claim['task']['base_sha'], 'baseline_hash': fingerprint(baseline),
+             'public_files': files, 'created_empty_placeholders': sorted(placeholders),
+             'inventory_complete_for_public_files': True, 'tool_readiness_hash': fingerprint(readiness),
+             'required_checks': commands}
+    value['workspace'] = str(guarded(workspace).resolve(strict=True)) if workspace is not None else None
+    value['read_guidance'] = ('For a read that may encounter a missing file, use the AVAILABLE pinned absolute cat '
+        'path with ONE canonical absolute path inside this workspace. Relative cwd, multiple operands, mixed '
+        'unknown errors, shell expressions and permission denial are not recoverable ENOENT evidence. '
+        'Search the public inventory first. Successful path correction must close the existing pinned suite budget.')
+    if len(files) > 2048 or len(canonical(value).encode()) > 131072:
+        raise ContractError('TASK_CONTEXT_LIMIT')
+    return value
 
 
 def toml(value):
@@ -321,7 +345,7 @@ class NativeDevelopmentRunner:
             {'queue_id': queue.queue_id, 'task_hash': claim['task_hash'],
              'attempt_id': claim['attempt_id'], 'epoch': claim['epoch'],
              'policy_hash': queue.policy['policy_hash']}, seconds or claim['task']['budgets']['runtime_seconds'], fatal,
-            policy=policy, checks=checks)
+            policy=policy or (INDEPENDENT_POLICY if queue.independent_failures else FAILURE_POLICY), checks=checks)
 
     def tool_readiness(self, workspace, folder, role, allowed_files, binding, stop, processes):
         """Controller-owned native probe in the worker's actual PATH/cwd/profile.
@@ -427,11 +451,13 @@ class NativeDevelopmentRunner:
             workspace, _ = allocate(self.root, self.repo, claim)
             (workspace / '.tmp').mkdir()
             snapshot = materialize(queue, claim, workspace)
+            placeholders = []
             for name in claim['task']['allowed_files']:
                 file = guarded(workspace / name)
                 file.parent.mkdir(parents=True, exist_ok=True)
                 if not file.exists():
                     frozen_bytes(file, b'')
+                    placeholders.append(name)
             if self.repo_adapter:
                 self.repo_adapter.prepare(workspace)
             baseline = self._scan(workspace, ignore_scratch=True)
@@ -451,6 +477,13 @@ class NativeDevelopmentRunner:
                 claim['task']['allowed_files'], {'queue_id': queue.queue_id, 'task_hash': claim['task_hash'],
                     'attempt_id': claim['attempt_id'], 'epoch': claim['epoch'], 'policy_hash': queue.policy['policy_hash']},
                 local_stop, processes)
+            if self._scan(workspace, ignore_scratch=True) != baseline:
+                raise ContractError('READINESS_CHANGED_WORKSPACE')
+            context = task_context(queue, claim, baseline, placeholders, readiness, worker_commands, workspace=workspace)
+            frozen_bytes(folder / 'task-context.json', canonical(context).encode())
+            if queue.independent_failures:
+                monitor.bind_read_context(RepoReadContext(workspace, context['public_files'],
+                    readiness['inventory']['tools'], fingerprint(context)))
             prompt = ('Complete this authorized development task using native tools. '
                       'Only edit allowed_files, including tests only when explicitly assigned. Do not spawn agents, change instructions/Git, '
                       'or access credentials, controller, other worktrees or network. '
@@ -465,6 +498,9 @@ class NativeDevelopmentRunner:
             prompt += '\nController tool readiness: ' + canonical({
                 'inventory': readiness['inventory'], 'guidance': readiness['guidance'],
                 'receipt_hash': fingerprint(readiness)})
+            prompt += ('\nController public file inventory (hashes bind the dispatch baseline; empty placeholders '
+                       'are scaffolding, not completed implementations). Locate files here before guessing paths. '
+                       'Excluded metadata/dependencies/secrets/scratch confer no additional access: ' + canonical(context))
             if worker_commands:
                 prompt += ('\nRead the relevant declarations and tsconfig before editing. Before finishing, run ALL '
                            'following pinned checks yourself, after your final modifications. Use each exact literal command '
@@ -476,7 +512,8 @@ class NativeDevelopmentRunner:
             intent = {'mode': 'DEVELOPMENT', 'queue_id': queue.queue_id, 'claim': claim,
                       'argv': argv, 'config_hash': self.config_hash, 'pins': {str(p): h for p, h in self.pins.items()},
                       'settings': settings, 'baseline': baseline, 'challenge': uuid.uuid4().hex,
-                      'worker_failure_policy': FAILURE_POLICY, 'tool_readiness_hash': fingerprint(readiness)}
+                      'worker_failure_policy': monitor.policy, 'tool_readiness_hash': fingerprint(readiness),
+                      'failure_isolation_hash': queue.failure_isolation_hash, 'task_context_hash': fingerprint(context)}
             if check_plan:
                 intent['worker_check_plan'] = check_plan
             if self.repo_adapter:
@@ -496,28 +533,49 @@ class NativeDevelopmentRunner:
                 raise ContractError('WORKER_FAILURE_POLICY_STOP:' + monitor.reason)
             raw = (folder / 'worker.jsonl').read_bytes()
             completed = native_success(execution, raw)
-            tools = tool_evidence(raw)
-            worker_checks = worker_checks_evidence(raw, worker_commands)
             self._pins()
             if stop.is_set() or local_stop.is_set() or not queue.validating(claim):
                 raise ContractError('STALE_NATIVE_RESULT')
             # Artifact scope before *and* after validator; sandbox command is readonly.
             before_validation = self._scan(workspace, ignore_scratch=True)
-            receipt = artifact_manifest(workspace, claim, baseline, general=True, ignore_scratch=True, scanner=self._scan)
-            if self.artifact_guard:
-                for name in claim['task']['expected_artifacts']:
-                    self.artifact_guard(guarded(workspace / name).read_bytes(), Path(name).stem)
+            # Even an ordinary rejected turn must pass the protection checks first.
+            changed = {k for k in set(baseline) | set(before_validation) if baseline.get(k) != before_validation.get(k)}
+            if not changed <= set(claim['task']['allowed_files']):
+                raise ContractError('OUT_OF_SCOPE_DIFF')
+            if queue.independent_failures and git(workspace, 'rev-parse', 'HEAD') != claim['task']['base_sha']:
+                raise ContractError('WORKER_CHANGED_HEAD')
+            if any(before_validation.get(i['path']) != i['sha256'] for i in claim['task']['inputs']):
+                raise ContractError('INPUT_DRIFT')
             try:
+                if monitor.task_failure:
+                    raise CompletedTaskFailure(monitor.task_failure, monitor.summary())
+                try:
+                    tools = tool_evidence(raw)
+                    worker_checks = worker_checks_evidence(raw, worker_commands)
+                except ContractError as error:
+                    if queue.independent_failures and (str(error) == 'NO_REAL_TOOL_EXECUTION'
+                            or str(error).startswith('WORKER_REQUIRED_CHECK_NOT_OBSERVED:')):
+                        raise CompletedTaskFailure(str(error), {'execution_hash': digest(raw)}) from error
+                    raise
+                if queue.independent_failures and (not changed or any(
+                        name not in before_validation for name in claim['task']['expected_artifacts'])):
+                    raise CompletedTaskFailure('NO_CHANGE_OR_EXPECTED_ARTIFACT_MISSING', {'changed_files': sorted(changed)})
+                receipt = artifact_manifest(workspace, claim, baseline, general=True, ignore_scratch=True, scanner=self._scan)
+                if self.artifact_guard:
+                    for name in claim['task']['expected_artifacts']:
+                        self.artifact_guard(guarded(workspace / name).read_bytes(), Path(name).stem)
                 validation = self.validate(claim, workspace, folder, local_stop, processes=processes,
                                            deadline=monitor.deadline)
             except OrdinaryValidationFailure as failure:
                 if self._scan(workspace, ignore_scratch=True) != before_validation or not attempt_cleanup_known(processes):
                     raise ContractError('LOCAL_FAILURE_CUSTODY_OR_CLEANUP_UNKNOWN') from failure
                 self._handoff_claim(claim, done, heartbeat, monitor, local_stop, stop)
-                report = {'status': 'BLOCKED', 'failure_scope': 'TASK', 'category': 'VALIDATOR_ASSERTION',
+                report = {'status': 'BLOCKED', 'failure_scope': 'TASK',
+                    'category': 'WORKER_ACCEPTANCE_FAILURE' if isinstance(failure, CompletedTaskFailure) else 'VALIDATOR_ASSERTION',
                     'task_id': claim['task']['task_id'], 'task_hash': claim['task_hash'],
                     'attempt_id': claim['attempt_id'], 'epoch': claim['epoch'], 'queue_id': queue.queue_id,
                     'policy_hash': queue.policy['policy_hash'], 'reason': str(failure), 'no_retry': True,
+                    'failure_isolation_hash': queue.failure_isolation_hash,
                     'process_tree_empty': True, 'provider_completion_known': True, 'completion': completed,
                     'execution_hash': digest(raw), 'processes': processes, 'worker_failure_evidence': monitor.summary(),
                     'validation_failure': failure.evidence}
@@ -542,6 +600,7 @@ class NativeDevelopmentRunner:
                             'process_evidence_hash': fingerprint(processes),
                             'scratch_evidence': {k: v for k, v in self._scan(workspace).items() if k.startswith('.tmp/')},
                             'worker_failure_evidence': monitor.summary()})
+            receipt.update(task_context_hash=fingerprint(context), failure_isolation_hash=queue.failure_isolation_hash)
             if self.repo_adapter:
                 receipt['repo_adapter'] = self.repo_adapter.receipt(workspace, baseline)
             receipt['artifact_manifest_hash'] = queue.artifacts.publish(claim, workspace, receipt['artifacts'])
@@ -642,14 +701,15 @@ class NativeDevelopmentRunner:
         """No provider or merge: validate a reviewed batch under native policy."""
         from .merge_validation import reviewed_batch, prepare_integration, verify_integration
         queue = self.queue
-        batch = reviewed_batch(queue, task_ids)
         if queue.task_failure_latched():
             raise ContractError('CAMPAIGN_TASK_FAILURE_NO_INTEGRATION')
+        batch = reviewed_batch(queue, task_ids)
         nonce = uuid.uuid4().hex
         folder = queue.path.parent / 'integration-execution' / nonce
         folder.mkdir(parents=True, exist_ok=False)
         with queue.transaction() as db:
-            if db.execute('SELECT 1 FROM integration_failures UNION ALL SELECT 1 FROM isolated_task_failures LIMIT 1').fetchone():
+            if (db.execute('SELECT 1 FROM integration_failures UNION ALL SELECT 1 FROM isolated_task_failures LIMIT 1').fetchone()
+                    or queue.independent_failures and queue.work_blocked(db)):
                 raise ContractError('INTEGRATION_FAILURE_STOP')
             if (db.execute("SELECT 1 FROM tasks WHERE state IN ('CLAIMED','RUNNING','VALIDATING','HELD') LIMIT 1").fetchone()
                     or db.execute('SELECT 1 FROM development_native_slots LIMIT 1').fetchone()):
@@ -736,13 +796,14 @@ class NativeDevelopmentRunner:
         return result
 
     def review(self, task_id, stop):
-        if self.queue.task_failure_latched():
+        if not self.queue.independent_failures and self.queue.task_failure_latched():
             raise ContractError('CAMPAIGN_TASK_FAILURE_NO_REVIEW')
         queue = self.queue
         # Only this method can publish Development reviews, immediately after
         # controller launch/completion. No caller-supplied review receipt API.
         with queue.transaction() as db:
-            if db.execute('SELECT 1 FROM integration_failures UNION ALL SELECT 1 FROM isolated_task_failures LIMIT 1').fetchone():
+            if (queue.work_blocked(db, task_id) if queue.independent_failures else
+                    db.execute('SELECT 1 FROM integration_failures UNION ALL SELECT 1 FROM isolated_task_failures LIMIT 1').fetchone()):
                 stop.set()
                 return {'status': 'BLOCKED', 'reason': 'INTEGRATION_FAILURE_STOP', 'task_id': task_id}
             if db.execute('SELECT 1 FROM development_review_dispatch WHERE task=?', (task_id,)).fetchone():
@@ -764,7 +825,8 @@ class NativeDevelopmentRunner:
             'findings': {'type': 'array', 'items': {'type': 'string'}}},
             'required': ['decision', 'findings'], 'additionalProperties': False}).encode())
         with queue.transaction() as db:
-            if db.execute('SELECT 1 FROM integration_failures UNION ALL SELECT 1 FROM isolated_task_failures LIMIT 1').fetchone():
+            if (queue.work_blocked(db, task_id) if queue.independent_failures else
+                    db.execute('SELECT 1 FROM integration_failures UNION ALL SELECT 1 FROM isolated_task_failures LIMIT 1').fetchone()):
                 stop.set()
                 return {'status': 'BLOCKED', 'reason': 'INTEGRATION_FAILURE_STOP', 'task_id': task_id}
             owner = db.execute('SELECT * FROM supervisor_lock').fetchone()
@@ -822,6 +884,8 @@ class NativeDevelopmentRunner:
                        'assurance': 'CONTROLLER_EXECUTION_NATIVE_TRUST'}
             frozen_bytes(folder / 'receipt.json', canonical(receipt).encode())
             with queue.transaction() as db:
+                if stop.is_set() or (queue.independent_failures and queue.work_blocked(db, task_id, review_nonce=target['nonce'])):
+                    raise ContractError('GLOBAL_FAILURE_BEFORE_REVIEW_PUBLICATION')
                 owner = db.execute('SELECT * FROM supervisor_lock').fetchone()
                 if (not owner or owner['owner'] != getattr(self, 'supervisor_owner', None)
                         or owner['expires'] <= time.time()):
@@ -849,15 +913,38 @@ class NativeDevelopmentRunner:
                            (task_id, canonical(envelope), fingerprint(envelope), 'development_controller_cli'))
                 state = 'PASSED' if verdict['decision'] == 'PASS' else 'FAILED'
                 db.execute('UPDATE tasks SET state=? WHERE id=?', (state, task_id))
+                if state == 'FAILED' and queue.independent_failures:
+                    rejected = {'queue_id': queue.queue_id, 'task_id': task_id, 'task_hash': row['hash'],
+                        'attempt_id': row['attempt_id'], 'epoch': row['epoch'],
+                        'policy_hash': queue.policy['policy_hash'], 'failure_isolation_hash': queue.failure_isolation_hash,
+                        'failure_scope': 'TASK', 'category': 'REVIEW_REJECTED', 'no_retry': True,
+                        'process_tree_empty': True, 'provider_completion_known': True,
+                        'worker_receipt_hash': target['receipt_hash'], 'review_receipt_hash': fingerprint(receipt)}
+                    db.execute('UPDATE tasks SET receipt=?,provider_unknown=0,expires=NULL WHERE id=?',
+                               (canonical(rejected), task_id))
+                    db.execute('INSERT INTO isolated_task_failures VALUES(?,?,?,?)',
+                               (task_id, row['attempt_id'], row['epoch'], fingerprint(rejected)))
+                    queue._event(db, task_id, 'isolated_review_rejection', receipt_hash=fingerprint(rejected), no_retry=True)
                 db.execute('UPDATE merge_queue SET reason=? WHERE task=?',
                            ('HUMAN_MERGE_AUTHORIZATION_REQUIRED' if state == 'PASSED' else 'REVIEW_REJECTED', task_id))
                 queue._event(db, task_id, state, review_hash=fingerprint(envelope), evidence_mode='DEVELOPMENT')
                 queue._ready(db)
             return {'status': state, 'task_id': task_id, 'review_hash': fingerprint(envelope),
-                    'assurance': receipt['assurance'], 'merge_executed': False}
+                    'assurance': receipt['assurance'], 'merge_executed': False,
+                    'failure_scope': 'TASK' if state == 'FAILED' and queue.independent_failures else None}
         except Exception as error:
             result = {'status': 'BLOCKED', 'task_id': task_id, 'reason': str(error), 'no_retry': True}
             frozen_bytes(folder / 'failure.json', canonical(result).encode())
+            if queue.independent_failures:
+                # Clean local process exit is not a known provider review verdict.
+                # Unresolved dispatch is independently fail-closed on restart even
+                # if this durable publication itself is interrupted.
+                with queue.transaction() as db:
+                    db.execute('INSERT INTO integration_failures VALUES(?,?)',
+                               ('review-failure:' + target['nonce'], fingerprint(result)))
+                    queue._event(db, task_id, 'global_review_failure', nonce=target['nonce'],
+                                 receipt_hash=fingerprint(result), no_retry=True,
+                                 process_cleanup_known=process_clean(execution))
             return result
         finally:
             # Unknown crash cleanup retains the capacity reservation for recovery.

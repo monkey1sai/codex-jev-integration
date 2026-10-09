@@ -14,10 +14,16 @@ ACTIVE = {'CLAIMED', 'RUNNING', 'VALIDATING', 'HELD'}
 
 
 class Phase2Queue(CoreQueue):
-    def __init__(self, *args, evidence_mode='production', review_registry=None, registry_sha256=None, **kwargs):
+    def __init__(self, *args, evidence_mode='production', review_registry=None, registry_sha256=None,
+                 failure_isolation='legacy_campaign', **kwargs):
         if evidence_mode not in {'production', 'OFFLINE_TEST', 'DEVELOPMENT'}:
             raise ContractError('EVIDENCE_MODE')
         self.evidence_mode = evidence_mode
+        if (failure_isolation not in {'legacy_campaign', 'independent_tasks_v1'}
+                or failure_isolation != 'legacy_campaign' and evidence_mode != 'DEVELOPMENT'):
+            raise ContractError('FAILURE_ISOLATION_MODE')
+        self.failure_isolation = failure_isolation
+        self.failure_isolation_hash = fingerprint({'mode': failure_isolation, 'version': 1})
         mode = 'development' if evidence_mode == 'DEVELOPMENT' else 'high_assurance'
         if 'execution_mode' in kwargs and kwargs['execution_mode'] != mode:
             raise ContractError('EXECUTION_MODE_MISMATCH')
@@ -43,6 +49,14 @@ class Phase2Queue(CoreQueue):
             db.execute('CREATE TABLE IF NOT EXISTS scheduler_decision(id INTEGER PRIMARY KEY CHECK(id=1), hash TEXT)')
             db.execute('CREATE TABLE IF NOT EXISTS integration_failures(nonce TEXT PRIMARY KEY, receipt_hash TEXT)')
             db.execute('CREATE TABLE IF NOT EXISTS isolated_task_failures(task TEXT PRIMARY KEY, attempt TEXT, epoch INTEGER, receipt_hash TEXT)')
+            db.execute('CREATE TABLE IF NOT EXISTS failure_isolation_binding(id INTEGER PRIMARY KEY CHECK(id=1), hash TEXT)')
+            old = db.execute('SELECT hash FROM failure_isolation_binding').fetchone()
+            if old is None:
+                if failure_isolation != 'legacy_campaign' and db.execute('SELECT 1 FROM tasks LIMIT 1').fetchone():
+                    raise ContractError('FRESH_ISOLATION_QUEUE_REQUIRED')
+                db.execute('INSERT INTO failure_isolation_binding VALUES(1,?)', (self.failure_isolation_hash,))
+            elif old['hash'] != self.failure_isolation_hash:
+                raise ContractError('FAILURE_ISOLATION_DRIFT')
         from .evidence import ReviewTrust, ArtifactStore
         self.trust = ReviewTrust(review_registry, registry_sha256, self.path.parent / 'review-verification', self.repo) if review_registry else None
         if bool(review_registry) != bool(registry_sha256):
@@ -95,22 +109,64 @@ class Phase2Queue(CoreQueue):
         with self.transaction() as db:
             return db.execute('SELECT 1 FROM isolated_task_failures LIMIT 1').fetchone() is not None
 
+    @property
+    def independent_failures(self):
+        return self.failure_isolation == 'independent_tasks_v1'
+
+    def work_blocked(self, db, task_id=None, *, review_nonce=None):
+        """Transactional admission: legacy latch is never reinterpreted."""
+        binding = db.execute('SELECT hash FROM failure_isolation_binding').fetchone()
+        if not binding or binding['hash'] != self.failure_isolation_hash:
+            raise ContractError('FAILURE_ISOLATION_DRIFT')
+        if db.execute('SELECT 1 FROM integration_failures LIMIT 1').fetchone():
+            return True
+        if self.independent_failures and db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='development_review_dispatch'").fetchone():
+            unresolved = db.execute('SELECT d.nonce FROM development_review_dispatch d '
+                                    'LEFT JOIN review_runtime r ON d.nonce=r.nonce WHERE r.nonce IS NULL').fetchall()
+            if any(row['nonce'] != review_nonce for row in unresolved):
+                return True
+        latched = db.execute('SELECT 1 FROM isolated_task_failures LIMIT 1').fetchone()
+        if latched and not self.independent_failures:
+            return True
+        failures = db.execute("SELECT 1 FROM tasks WHERE state IN ('FAILED','CANCELLED','HELD') LIMIT 1").fetchone()
+        if failures and not self.failures_are_isolated(db=db):
+            return True
+        if latched and self.independent_failures and not self.failures_are_isolated(db=db):
+            return True
+        if task_id is not None:
+            row = db.execute('SELECT contract,state FROM tasks WHERE id=?', (task_id,)).fetchone()
+            if not row or row['state'] in {'FAILED', 'HELD', 'CANCELLED'}:
+                return True
+            # A healthy task never receives an unaccepted dependency artifact.
+            for dep in json.loads(row['contract'])['dependencies']:
+                upstream = db.execute('SELECT state FROM tasks WHERE id=?', (dep,)).fetchone()
+                if not upstream or upstream['state'] != 'PASSED':
+                    return True
+        return False
+
     def isolate_task_failure(self, claim, receipt):
         """Controller-only handoff after known completion/cleanup; never a retry.
 
-        The durable latch blocks further dispatch, review and even subset integration.
-        Existing independent workers may finish into REVIEW, never automatic PASSED.
+        Legacy latch blocks dispatch/review. A fresh independent queue may continue
+        healthy branches within original budgets; both versions forbid subset integration.
         """
         self._fresh()
         expected = {'queue_id': self.queue_id, 'task_id': claim['task']['task_id'],
                     'task_hash': claim['task_hash'], 'attempt_id': claim['attempt_id'],
                     'epoch': claim['epoch'], 'policy_hash': self.policy['policy_hash'],
-                    'failure_scope': 'TASK', 'category': 'VALIDATOR_ASSERTION',
+                    'failure_scope': 'TASK',
                     'process_tree_empty': True, 'provider_completion_known': True, 'no_retry': True}
-        if (self.evidence_mode != 'DEVELOPMENT' or any(receipt.get(k) != v for k, v in expected.items())
+        categories = {'VALIDATOR_ASSERTION'} | ({'WORKER_ACCEPTANCE_FAILURE'} if self.independent_failures else set())
+        if (self.evidence_mode != 'DEVELOPMENT' or receipt.get('category') not in categories
+                or any(receipt.get(k) != v for k, v in expected.items())
+                or self.independent_failures and receipt.get('failure_isolation_hash') != self.failure_isolation_hash
                 or any(receipt.get(k) is not True for k in ('process_tree_empty', 'provider_completion_known', 'no_retry'))):
             raise ContractError('TASK_FAILURE_BINDING')
         with self.transaction() as db:
+            blocked = self.work_blocked(db)
+            if self.independent_failures and blocked:
+                return False
             if not self._current(db, claim, {'VALIDATING'}, time.time()):
                 return False
             key = claim['task']['task_id']
@@ -120,22 +176,38 @@ class Phase2Queue(CoreQueue):
             db.execute('INSERT INTO isolated_task_failures VALUES(?,?,?,?)',
                        (key, claim['attempt_id'], claim['epoch'], fingerprint(receipt)))
             self._event(db, key, 'isolated_task_failure', attempt_id=claim['attempt_id'], epoch=claim['epoch'],
-                        receipt_hash=fingerprint(receipt), failure_scope='TASK', no_refill=True, no_retry=True)
+                        receipt_hash=fingerprint(receipt), failure_scope='TASK',
+                        failure_isolation_hash=self.failure_isolation_hash,
+                        no_refill=not self.independent_failures, no_retry=True)
             return True
 
-    def failures_are_isolated(self):
+    def failures_are_isolated(self, *, db=None):
         """Unmarked historical failures and any HELD/CANCELLED remain global stops."""
-        with self.transaction() as db:
-            failures = db.execute("SELECT * FROM tasks WHERE state IN ('FAILED','CANCELLED','HELD')").fetchall()
-            if not failures:
+        if db is None:
+            with self.transaction() as connection:
+                return self.failures_are_isolated(db=connection)
+        failures = db.execute("SELECT * FROM tasks WHERE state IN ('FAILED','CANCELLED','HELD')").fetchall()
+        if not failures:
+            return False
+        if self.independent_failures and len(failures) != db.execute('SELECT count(*) FROM isolated_task_failures').fetchone()[0]:
+            return False
+        for row in failures:
+            marker = db.execute('SELECT * FROM isolated_task_failures WHERE task=?', (row['id'],)).fetchone()
+            receipt = json.loads(row['receipt']) if row['receipt'] else {}
+            if (not marker or row['state'] != 'FAILED' or row['provider_unknown']
+                    or marker['attempt'] != row['attempt_id'] or marker['epoch'] != row['epoch']
+                    or marker['receipt_hash'] != fingerprint(receipt)
+                    or self.independent_failures and receipt.get('failure_isolation_hash') != self.failure_isolation_hash):
                 return False
-            for row in failures:
-                marker = db.execute('SELECT * FROM isolated_task_failures WHERE task=?', (row['id'],)).fetchone()
-                if (not marker or row['state'] != 'FAILED' or row['provider_unknown']
-                        or marker['attempt'] != row['attempt_id'] or marker['epoch'] != row['epoch']
-                        or marker['receipt_hash'] != fingerprint(json.loads(row['receipt']))):
-                    return False
-            return True
+            if self.independent_failures and (receipt.get('category') not in {
+                    'VALIDATOR_ASSERTION', 'WORKER_ACCEPTANCE_FAILURE', 'REVIEW_REJECTED'}
+                    or any(receipt.get(k) != v for k, v in {
+                        'queue_id': self.queue_id, 'task_id': row['id'], 'task_hash': row['hash'],
+                        'attempt_id': row['attempt_id'], 'epoch': row['epoch'],
+                        'policy_hash': self.policy['policy_hash'], 'failure_scope': 'TASK'}.items())
+                    or any(receipt.get(k) is not True for k in ('no_retry', 'provider_completion_known', 'process_tree_empty'))):
+                return False
+        return True
 
     def claim(self, lease_seconds=180, now=None, *, capabilities=None, halt_on_failure=False):
         self._fresh()
@@ -156,10 +228,14 @@ class Phase2Queue(CoreQueue):
             if db.execute('SELECT 1 FROM integration_failures LIMIT 1').fetchone():
                 audit('INTEGRATION_FAILURE_STOP')
                 return None
-            if db.execute('SELECT 1 FROM isolated_task_failures LIMIT 1').fetchone():
+            if db.execute('SELECT 1 FROM isolated_task_failures LIMIT 1').fetchone() and not self.independent_failures:
                 audit('ISOLATED_TASK_FAILURE_NO_REFILL')
                 return None
-            if halt_on_failure and db.execute("SELECT 1 FROM tasks WHERE state IN ('HELD','FAILED','CANCELLED') LIMIT 1").fetchone():
+            if self.independent_failures and self.work_blocked(db):
+                audit('GLOBAL_FAILURE_STOP')
+                return None
+            if (halt_on_failure and db.execute("SELECT 1 FROM tasks WHERE state IN ('HELD','FAILED','CANCELLED') LIMIT 1").fetchone()
+                    and not (self.independent_failures and self.failures_are_isolated(db=db))):
                 audit('FAILURE_STOP')
                 return None
             self._ready(db)
@@ -314,7 +390,8 @@ class Phase2Queue(CoreQueue):
     def dispatch_intent(self, claim):
         self._fresh()
         with self.transaction() as db:
-            if db.execute('SELECT 1 FROM isolated_task_failures LIMIT 1').fetchone():
+            if ((self.independent_failures and self.work_blocked(db, claim['task']['task_id']))
+                    or not self.independent_failures and db.execute('SELECT 1 FROM isolated_task_failures LIMIT 1').fetchone()):
                 return False
             row = db.execute('SELECT * FROM tasks WHERE id=?', (claim['task']['task_id'],)).fetchone()
             if not self._current(db, claim, {'RUNNING'}, time.time()) or row['provider_unknown']:
