@@ -1149,3 +1149,15 @@ Worker 效果 NOT_RUN。沒有重派、Global/權限變更、Jev Phase3、push/P
 05/06 FAIL/PARTIAL、Global production 與高保證 optional gates 均保留。
 新真實遊戲雙 Worker/Review/Integration **NOT_RUN**；需獨立 2 Worker＋2 Review、零 retry
 及隔離 clone 的 max_active=2 明確批准。整體 Agent Factory 仍 **PARTIAL**。
+
+## Authorized real parallel game Campaign — stopped
+
+以 `7b251f3` 及全新 `game-parallel-20261010-01` 執行獨立授權的 2 Worker＋2 Review、
+零 retry。兩個真實 CLI Agents 的 owned-cgroup 採樣重疊 66.037476 秒，各有獨立
+worktree 與不重疊候選修改；B 的 native rg 缺失啟動 60 秒 recovery window，turn
+未完成即 `RECOVERY_TIME_EXHAUSTED`，A 隨 shared stop 取消。裁決 **BLOCKED_NO_RETRY**，
+Worker 2/2、Review 0/2；Controller candidate validation／Review／integration 均 NOT_RUN。
+Frozen source、92 檔 evidence custody、清理與冷重啟停止已核對，330 項回歸 PASS。
+原 Repo HEAD/max_active=1、Global production、Failure Policy 與歷史 FAIL 不變。
+完整限制與下一步見 [actual Campaign report](game-parallel-campaign-01.md)；不將此結果
+改稱遊戲交付成功或 5-worker admission。
