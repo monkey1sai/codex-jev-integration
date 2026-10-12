@@ -89,7 +89,8 @@ def prepare(root, runtime):
         # thread/start is checked by these exact existing readiness probe names.
         if n == 0:
             results['session'] = native_check(runner, workspace, folder, 'readiness', ['/usr/bin/true'])
-            results['review'] = native_check(runner, workspace, folder, 'review-readiness', ['/usr/bin/true'], role='reviewer')
+            if adapter.review_budget:
+                results['review'] = native_check(runner, workspace, folder, 'review-readiness', ['/usr/bin/true'], role='reviewer')
         commands = runner.validators._commands(task, workspace)
         for command in commands:
             if command['validator'] in adapter.authorize_task(task):
@@ -121,6 +122,9 @@ def execute(root, runtime, *, worker_budget, review_budget, active_cap, authoriz
                         capabilities={t['capability'] for t in tasks}).run(max_seconds=600)
     result.update(binding, status='BLOCKED_NO_RETRY', attempt_retry=0)
     try:
+        if review_budget == 0 and all(r['state'] == 'REVIEW' for r in queue.snapshot()['tasks']):
+            result['parallel'] = runner.parallel_evidence([t['task_id'] for t in tasks], require_review=False)
+            result['status'] = 'WORKERS_VALIDATED_REVIEW_DEFERRED'
         if all(r['state'] == 'PASSED' for r in queue.snapshot()['tasks']):
             result['parallel'] = runner.parallel_evidence([t['task_id'] for t in tasks])
             if result['parallel']['status'] == 'OVERLAP':
@@ -157,4 +161,4 @@ if __name__ == '__main__':
         worker_budget=args.worker_budget, review_budget=args.review_budget, active_cap=args.active_cap,
         authorization_reference=args.authorization_reference))
     print(json.dumps({k: result.get(k) for k in ('campaign_id', 'status', 'worker_turns', 'review_turns', 'merge_executed')}))
-    raise SystemExit(0 if result['status'] in {'PASS', 'READY_ZERO_PROVIDER'} else 1)
+    raise SystemExit(0 if result['status'] in {'PASS', 'READY_ZERO_PROVIDER', 'WORKERS_VALIDATED_REVIEW_DEFERRED'} else 1)

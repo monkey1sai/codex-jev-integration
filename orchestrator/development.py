@@ -757,13 +757,29 @@ class NativeDevelopmentRunner:
                              receipt_hash=fingerprint(report), process_tree_empty=report['process_tree_empty'])
         return report
 
-    def parallel_evidence(self, task_ids):
-        """Observed real CLI process overlap; submission count is insufficient."""
+    def parallel_evidence(self, task_ids, *, require_review=True):
+        """Process evidence only; unreviewed delivery never grants integration."""
         from .merge_validation import reviewed_batch
         self._pins()
         if self.queue.evidence_mode != 'DEVELOPMENT':
             raise ContractError('REAL_DEVELOPMENT_EVIDENCE_REQUIRED')
-        batch = reviewed_batch(self.queue, task_ids)
+        if require_review:
+            batch = reviewed_batch(self.queue, task_ids)
+        else:
+            if not task_ids or len(set(task_ids)) != len(task_ids):
+                raise ContractError('PARALLEL_TASK_SET')
+            bindings = []
+            with self.queue.transaction() as db:
+                for task_id in task_ids:
+                    row = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
+                    if row is None or row['state'] != 'REVIEW':
+                        raise ContractError('PARALLEL_VALIDATED_WORKER_REQUIRED')
+                    manifest, sha = self.queue.artifacts.verified(db, row)
+                    receipt = json.loads(row['receipt'])
+                    self.queue.artifacts.bind_receipt(manifest, sha, receipt)
+                    bindings.append({'task_id': task_id, 'attempt_id': row['attempt_id'],
+                                     'receipt_hash': fingerprint(receipt)})
+            batch = {'bindings': bindings, 'review': 'DEFERRED_NOT_APPROVED'}
         intervals, points = [], []
         for binding in batch['bindings']:
             folder = self.queue.path.parent / 'native-execution' / binding['attempt_id']

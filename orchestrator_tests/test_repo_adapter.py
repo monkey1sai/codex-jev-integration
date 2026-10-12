@@ -212,6 +212,40 @@ class RealRepoAdapter(unittest.TestCase):
                 session={'scheduler': {'max_active': 2, 'max_dispatches': 2, 'max_attempts': 1}})
         self.assertEqual(adapter.campaign['max_active'], 2)  # Marker is not authority.
 
+    def test_zero_review_budget_retains_required_review_task_contract(self):
+        adapter = self.campaign_adapter(reviews=0)
+        self.assertEqual(adapter.review_budget, 0)
+        self.assertTrue(all(t['review'] == {'required': True, 'independent': True}
+                            for t in self.campaign_tasks))
+        for invalid in (-1, True, 3):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ContractError, 'CAMPAIGN_LIMIT'):
+                self.campaign_adapter(reviews=invalid)
+
+    def test_readonly_tool_is_scoped_pinned_and_never_writable(self):
+        tool_root = self.root / 'controller/toolchains/blender'
+        tool_root.mkdir(parents=True)
+        executable = tool_root / 'blender'
+        executable.write_bytes(b'fixed executable')
+        self.value['readonly_tools'] = {'blender': {'root': str(tool_root), 'executable': str(executable),
+                                                  'sha256': digest(executable.read_bytes())}}
+        self.record.write_text(canonical(self.value))
+        adapter = RepoAdapter(self.root)
+        files, reads = adapter.permissions(self.repo, self.value['allowed_files'], [])
+        self.assertIn(str(tool_root), reads)
+        self.assertNotIn(str(tool_root), files)
+        self.assertEqual(set(reads) - {str(Path(self.value['node']).parent)}, {str(tool_root)})
+        executable.write_bytes(b'drift')
+        with self.assertRaisesRegex(ContractError, 'TOOL_DRIFT'):
+            adapter.verify()
+
+    def test_tool_cannot_grant_controller_or_external_root_reads(self):
+        for root in (self.root / 'controller', self.root.parent):
+            self.value['readonly_tools'] = {'blender': {'root': str(root), 'executable': str(self.root / 'controller/node'),
+                                                      'sha256': self.value['node_sha256']}}
+            self.record.write_text(canonical(self.value))
+            with self.subTest(root=root), self.assertRaisesRegex(ContractError, 'TOOL_SCOPE'):
+                RepoAdapter(self.root)
+
     def test_campaign_tamper_restart_unknown_task_and_excess_budget_rejected(self):
         adapter = self.campaign_adapter()
         with self.assertRaisesRegex(ContractError, 'CONTRACT_DRIFT'):

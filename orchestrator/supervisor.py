@@ -98,6 +98,15 @@ class Supervisor:
                             # Review is serial and runs only after all workers stop:
                             # reviewer processes count toward the same capacity.
                             rows = self.queue.snapshot()['tasks']
+                            adapter = getattr(self.native_runner, 'repo_adapter', None)
+                            if adapter is not None and adapter.review_budget == 0:
+                                # A worker-only campaign stops at the existing Review
+                                # gate. It cannot publish PASSED or unlock dependencies.
+                                adapter.verify()
+                                with self.queue.transaction() as db:
+                                    self.queue._event(db, None, 'review_deferred',
+                                        reason='ZERO_AUTHORIZED_REVIEW_BUDGET', adapter_hash=adapter.hash)
+                                break
                             if (any(r['state'] in {'HELD', 'FAILED', 'CANCELLED'} for r in rows)
                                     and not (self.queue.independent_failures and self.queue.failures_are_isolated())):
                                 self.stop.set()

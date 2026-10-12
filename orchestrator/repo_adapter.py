@@ -29,7 +29,7 @@ class RepoAdapter:
         self.path = self.root / 'controller/repo-adapter.json'
         self.value, self.hash = load(self.path, max_bytes=2 * 1024 * 1024)
         v = self.value
-        if set(v) - {'campaign'} != {'mode', 'repo', 'source', 'base_sha', 'bundle_sha256', 'allowed_files',
+        if set(v) - {'campaign', 'readonly_tools'} != {'mode', 'repo', 'source', 'base_sha', 'bundle_sha256', 'allowed_files',
                       'node', 'node_sha256', 'dependencies', 'dependency_hashes', 'protected_hashes'}:
             raise ContractError('REPO_ADAPTER_SCHEMA')
         self.repo = guarded(v['repo'])
@@ -54,7 +54,7 @@ class RepoAdapter:
             if (c['campaign_id'] != self.root.name or type(c['tasks']) is not dict
                     or not 1 <= len(c['tasks']) <= 38
                     or type(c['worker_budget']) is not int or c['worker_budget'] != len(c['tasks'])
-                    or type(c['review_budget']) is not int or not 1 <= c['review_budget'] <= c['worker_budget']
+                    or type(c['review_budget']) is not int or not 0 <= c['review_budget'] <= c['worker_budget']
                     or type(c['max_active']) is not int or not 1 <= c['max_active'] <= 2):
                 raise ContractError('REPO_CAMPAIGN_LIMIT')
             for task_id, entry in c['tasks'].items():
@@ -83,6 +83,19 @@ class RepoAdapter:
         v = self.value
         if digest(guarded(v['node']).read_bytes()) != v['node_sha256']:
             raise ContractError('REPO_NODE_DRIFT')
+        tools = v.get('readonly_tools', {})
+        if type(tools) is not dict or len(tools) > 4:
+            raise ContractError('REPO_TOOL_SCHEMA')
+        for name, tool in tools.items():
+            identifier(name)
+            if type(tool) is not dict or set(tool) != {'root', 'executable', 'sha256'}:
+                raise ContractError('REPO_TOOL_SCHEMA')
+            root, executable = guarded(tool['root']), guarded(tool['executable'])
+            if (root.parent != self.root / 'controller/toolchains' or not root.is_dir()
+                    or not executable.is_relative_to(root) or not executable.is_file()):
+                raise ContractError('REPO_TOOL_SCOPE')
+            if digest(executable.read_bytes()) != tool['sha256']:
+                raise ContractError('REPO_TOOL_DRIFT')
         for name, sha in v['protected_hashes'].items():
             # Write-contract paths deliberately reject AGENTS/.codex. These
             # separately trusted readonly pins must not use that write parser.
@@ -156,7 +169,8 @@ class RepoAdapter:
             files[str(Path(name).parent)] = 'write'
         for name in self.value['protected_hashes']:
             files[name] = 'read'
-        reads = (*extra_reads, str(Path(self.value['node']).parent))
+        reads = (*extra_reads, str(Path(self.value['node']).parent),
+                 *(tool['root'] for tool in self.value.get('readonly_tools', {}).values()))
         return files, reads
 
     def receipt(self, workspace, baseline):
