@@ -4,6 +4,7 @@ No inference turns, local command fallback or permission prompts. Readiness may
 load a native thread without starting a turn; startup metadata HTTP is possible.
 The parent owns this process tree using the existing cgroup lifecycle helper.
 """
+import hashlib
 import json
 from pathlib import Path
 import queue
@@ -11,6 +12,44 @@ import subprocess
 import sys
 import threading
 import time
+
+
+def public_config(config):
+    """Only the native settings needed to audit admission enter durable output."""
+    fields = ('default_permissions', 'approval_policy',
+              'approvals_reviewer', 'model', 'model_reasoning_effort')
+    # Environment values and provider/MCP configuration are deliberately omitted.
+    value = {key: config.get(key) for key in fields}
+    profiles = config.get('permissions')
+    profile = profiles.get('worker-minimal') if isinstance(profiles, dict) else None
+    if isinstance(profile, dict):
+        network = profile.get('network')
+        enabled = network.get('enabled') if isinstance(network, dict) else None
+        value['permission_summary'] = {
+            'profile': 'worker-minimal',
+            'network_enabled': enabled if type(enabled) is bool else None,
+            'filesystem_sha256': hashlib.sha256(json.dumps(profile.get('filesystem'),
+                sort_keys=True, separators=(',', ':')).encode()).hexdigest()}
+    return value
+
+
+def public_response(method, result):
+    """RPC transport receipts are not a license to persist arbitrary config."""
+    receipt = {'id': result.get('id')}
+    if 'error' in result:
+        receipt['error'] = {'classification': 'NATIVE_RPC_REJECTED'}
+    elif method == 'config/read':
+        receipt['result'] = {'config': public_config(result['result']['config'])}
+    elif method == 'thread/start':
+        started = result['result']
+        receipt['result'] = {key: started.get(key) for key in
+            ('model', 'reasoningEffort', 'approvalPolicy', 'approvalsReviewer')}
+        receipt['result']['thread'] = {'id': started['thread']['id']}
+    elif method == 'initialize':
+        receipt['result'] = {'initialized': True}
+    else:
+        receipt['result'] = result['result']
+    return receipt
 
 
 def execute(plan):
@@ -41,9 +80,9 @@ def execute(plan):
         while time.monotonic() < deadline:
             result = inbox.get(timeout=max(.01, deadline - time.monotonic()))
             if result.get('id') == number:
-                trace.append(result)
+                trace.append(public_response(method, result))
                 if 'error' in result:
-                    raise ValueError('NATIVE_RPC_REJECTED:' + json.dumps(result['error']))
+                    raise ValueError('NATIVE_RPC_REJECTED')
                 return result['result']
             if 'error' in result:
                 raise ValueError('NATIVE_RPC_EOF')
@@ -58,9 +97,7 @@ def execute(plan):
         process.stdin.flush()
         config = rpc('config/read', {'cwd': plan['workspace'], 'includeLayers': False}, 2)['config']
         # Only public native safety/config fields enter evidence; never credentials.
-        report['effective_config'] = {key: config.get(key) for key in
-            ('permissions', 'default_permissions', 'approval_policy', 'approvals_reviewer',
-             'model', 'model_reasoning_effort', 'features', 'shell_environment_policy')}
+        report['effective_config'] = public_config(config)
         if config.get('default_permissions') != 'worker-minimal':
             raise ValueError('NATIVE_PROFILE_MISMATCH')
         if config.get('approval_policy') != 'never':
