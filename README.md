@@ -1,5 +1,9 @@
 # Codex Jev integration
 
+目前收斂方向與日常使用方法見 [Codex + Jev handoff](docs/jev-codex-handoff.md)：
+保留 Jev advisory 整合；Worker／Campaign 只在使用者明確要求後執行。
+2026-10-13 的 Global 收斂候選尚未套用，四 Worker 動畫工作已停止並保存 WIP。
+
 Jev 2.2 is a standard-library-only MCP server for advisory role and resource selection in Codex CLI and App. It exposes six tools: `jev_status`, `jev_route`, `jev_report_outcome`, `jev_select_resources`, `jev_decide`, and `jev_report_selection_outcome`.
 
 This repository versions the four runtime modules, a nonsecret configuration example, the interface contracts, and 85 offline regression tests. The runtime files match the reviewed integration payload. Machine-specific maintenance launchers, permission drafts, live Codex configuration, journals, and backups remain outside this source repository.
