@@ -1,0 +1,598 @@
+"""Incremental controller over CoreQueue's storage and v2 policy/contracts.
+
+No live-admission bypass, trusted-review forgery, or merge executor.
+"""
+import json
+import time
+import uuid
+from .core_queue import CoreQueue
+from .contracts import ContractError, canonical, fingerprint
+
+STATES = {'PENDING', 'READY', 'CLAIMED', 'RUNNING', 'VALIDATING', 'REVIEW',
+          'PASSED', 'FAILED', 'HELD', 'CANCELLED'}
+ACTIVE = {'CLAIMED', 'RUNNING', 'VALIDATING', 'HELD'}
+
+
+class Phase2Queue(CoreQueue):
+    def __init__(self, *args, evidence_mode='production', review_registry=None, registry_sha256=None,
+                 failure_isolation='legacy_campaign', **kwargs):
+        if evidence_mode not in {'production', 'OFFLINE_TEST', 'DEVELOPMENT'}:
+            raise ContractError('EVIDENCE_MODE')
+        self.evidence_mode = evidence_mode
+        if (failure_isolation not in {'legacy_campaign', 'independent_tasks_v1'}
+                or failure_isolation != 'legacy_campaign' and evidence_mode != 'DEVELOPMENT'):
+            raise ContractError('FAILURE_ISOLATION_MODE')
+        self.failure_isolation = failure_isolation
+        self.failure_isolation_hash = fingerprint({'mode': failure_isolation, 'version': 1})
+        mode = 'development' if evidence_mode == 'DEVELOPMENT' else 'high_assurance'
+        if 'execution_mode' in kwargs and kwargs['execution_mode'] != mode:
+            raise ContractError('EXECUTION_MODE_MISMATCH')
+        kwargs['execution_mode'] = mode
+        super().__init__(*args, **kwargs)
+        with self.transaction() as db:
+            db.execute('CREATE TABLE IF NOT EXISTS phase2_binding(id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER)')
+            if not db.execute('SELECT 1 FROM phase2_binding').fetchone():
+                if db.execute('SELECT 1 FROM tasks').fetchone():
+                    raise ContractError('LEGACY_QUEUE_MIGRATION_REQUIRED')
+                db.execute('INSERT INTO phase2_binding VALUES(1,1)')
+            db.execute('CREATE TABLE IF NOT EXISTS merge_queue(task TEXT PRIMARY KEY, receipt_hash TEXT, status TEXT, reason TEXT)')
+            db.execute('CREATE TABLE IF NOT EXISTS evidence_binding(id INTEGER PRIMARY KEY CHECK(id=1), mode TEXT, registry_hash TEXT, queue_id TEXT)')
+            db.execute('INSERT OR IGNORE INTO evidence_binding VALUES(1,?,?,?)', (evidence_mode, registry_sha256, uuid.uuid4().hex))
+            binding = db.execute('SELECT * FROM evidence_binding').fetchone()
+            if binding['mode'] != evidence_mode or binding['registry_hash'] != registry_sha256:
+                raise ContractError('EVIDENCE_BINDING_DRIFT')
+            self.queue_id = binding['queue_id']
+            db.execute('CREATE TABLE IF NOT EXISTS review_challenges(nonce TEXT PRIMARY KEY, task TEXT, target TEXT, used INTEGER DEFAULT 0)')
+            db.execute('CREATE TABLE IF NOT EXISTS reviews(task TEXT PRIMARY KEY, envelope TEXT, hash TEXT, source TEXT)')
+            db.execute('CREATE TABLE IF NOT EXISTS review_runtime(nonce TEXT PRIMARY KEY, hash TEXT UNIQUE, receipt TEXT)')
+            db.execute('CREATE TABLE IF NOT EXISTS development_native_slots(actor TEXT PRIMARY KEY, task TEXT, nonce TEXT)')
+            db.execute('CREATE TABLE IF NOT EXISTS scheduler_decision(id INTEGER PRIMARY KEY CHECK(id=1), hash TEXT)')
+            db.execute('CREATE TABLE IF NOT EXISTS integration_failures(nonce TEXT PRIMARY KEY, receipt_hash TEXT)')
+            db.execute('CREATE TABLE IF NOT EXISTS isolated_task_failures(task TEXT PRIMARY KEY, attempt TEXT, epoch INTEGER, receipt_hash TEXT)')
+            db.execute('CREATE TABLE IF NOT EXISTS failure_isolation_binding(id INTEGER PRIMARY KEY CHECK(id=1), hash TEXT)')
+            old = db.execute('SELECT hash FROM failure_isolation_binding').fetchone()
+            if old is None:
+                if failure_isolation != 'legacy_campaign' and db.execute('SELECT 1 FROM tasks LIMIT 1').fetchone():
+                    raise ContractError('FRESH_ISOLATION_QUEUE_REQUIRED')
+                db.execute('INSERT INTO failure_isolation_binding VALUES(1,?)', (self.failure_isolation_hash,))
+            elif old['hash'] != self.failure_isolation_hash:
+                raise ContractError('FAILURE_ISOLATION_DRIFT')
+        from .evidence import ReviewTrust, ArtifactStore
+        self.trust = ReviewTrust(review_registry, registry_sha256, self.path.parent / 'review-verification', self.repo) if review_registry else None
+        if bool(review_registry) != bool(registry_sha256):
+            raise ContractError('TRUST_PIN_REQUIRED')
+        self.artifacts = ArtifactStore(self)
+
+    @staticmethod
+    def _event(db, key, name, **data):
+        db.execute('INSERT INTO events(task,event,at) VALUES(?,?,?)',
+                   (key, canonical({'event': name, **data}), time.time()))
+
+    def enqueue(self, tasks):
+        self._fresh()
+        if type(tasks) is list:
+            tasks = [normalize_task(t) for t in tasks]
+        # CoreQueue's validator validates the complete DAG, policy and exact scope.
+        with self.transaction() as db:
+            existing = {r['id']: json.loads(r['contract']) for r in db.execute('SELECT * FROM tasks')}
+            if type(tasks) is not list or not tasks:
+                raise ContractError('CONTRACT_SCHEMA')
+            ids = [t.get('task_id') for t in tasks if type(t) is dict]
+            if len(ids) != len(tasks) or len(set(ids)) != len(ids):
+                raise ContractError('DUPLICATE_TASK_ID')
+            for task in tasks:
+                key = task['task_id']
+                if key in existing and fingerprint(existing[key]) != fingerprint(task):
+                    raise ContractError('IMMUTABLE_TASK_DRIFT')
+                existing[key] = task
+            self.validator(list(existing.values()))
+            for task in tasks:
+                inserted = db.execute('INSERT OR IGNORE INTO tasks(id,contract,hash,state) VALUES(?,?,?,?)',
+                                      (task['task_id'], canonical(task), fingerprint(task), 'PENDING')).rowcount
+                if inserted:
+                    self._event(db, task['task_id'], 'PENDING', contract_hash=fingerprint(task))
+            self._ready(db)
+
+    def _ready(self, db):
+        states = dict(db.execute('SELECT id,state FROM tasks'))
+        for row in db.execute("SELECT * FROM tasks WHERE state='PENDING'").fetchall():
+            task = json.loads(row['contract'])
+            if all(states.get(dep) == 'PASSED' for dep in task['dependencies']):
+                db.execute("UPDATE tasks SET state='READY' WHERE id=?", (row['id'],))
+                self._event(db, row['id'], 'READY')
+
+    def integration_stopped(self):
+        with self.transaction() as db:
+            return db.execute('SELECT 1 FROM integration_failures LIMIT 1').fetchone() is not None
+
+    def task_failure_latched(self):
+        with self.transaction() as db:
+            return db.execute('SELECT 1 FROM isolated_task_failures LIMIT 1').fetchone() is not None
+
+    @property
+    def independent_failures(self):
+        return self.failure_isolation == 'independent_tasks_v1'
+
+    def work_blocked(self, db, task_id=None, *, review_nonce=None):
+        """Transactional admission: legacy latch is never reinterpreted."""
+        binding = db.execute('SELECT hash FROM failure_isolation_binding').fetchone()
+        if not binding or binding['hash'] != self.failure_isolation_hash:
+            raise ContractError('FAILURE_ISOLATION_DRIFT')
+        if db.execute('SELECT 1 FROM integration_failures LIMIT 1').fetchone():
+            return True
+        if self.independent_failures and db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='development_review_dispatch'").fetchone():
+            unresolved = db.execute('SELECT d.nonce FROM development_review_dispatch d '
+                                    'LEFT JOIN review_runtime r ON d.nonce=r.nonce WHERE r.nonce IS NULL').fetchall()
+            if any(row['nonce'] != review_nonce for row in unresolved):
+                return True
+        latched = db.execute('SELECT 1 FROM isolated_task_failures LIMIT 1').fetchone()
+        if latched and not self.independent_failures:
+            return True
+        failures = db.execute("SELECT 1 FROM tasks WHERE state IN ('FAILED','CANCELLED','HELD') LIMIT 1").fetchone()
+        if failures and not self.failures_are_isolated(db=db):
+            return True
+        if latched and self.independent_failures and not self.failures_are_isolated(db=db):
+            return True
+        if task_id is not None:
+            row = db.execute('SELECT contract,state FROM tasks WHERE id=?', (task_id,)).fetchone()
+            if not row or row['state'] in {'FAILED', 'HELD', 'CANCELLED'}:
+                return True
+            # A healthy task never receives an unaccepted dependency artifact.
+            for dep in json.loads(row['contract'])['dependencies']:
+                upstream = db.execute('SELECT state FROM tasks WHERE id=?', (dep,)).fetchone()
+                if not upstream or upstream['state'] != 'PASSED':
+                    return True
+        return False
+
+    def isolate_task_failure(self, claim, receipt):
+        """Controller-only handoff after known completion/cleanup; never a retry.
+
+        Legacy latch blocks dispatch/review. A fresh independent queue may continue
+        healthy branches within original budgets; both versions forbid subset integration.
+        """
+        self._fresh()
+        expected = {'queue_id': self.queue_id, 'task_id': claim['task']['task_id'],
+                    'task_hash': claim['task_hash'], 'attempt_id': claim['attempt_id'],
+                    'epoch': claim['epoch'], 'policy_hash': self.policy['policy_hash'],
+                    'failure_scope': 'TASK',
+                    'process_tree_empty': True, 'provider_completion_known': True, 'no_retry': True}
+        categories = {'VALIDATOR_ASSERTION'} | ({'WORKER_ACCEPTANCE_FAILURE'} if self.independent_failures else set())
+        if (self.evidence_mode != 'DEVELOPMENT' or receipt.get('category') not in categories
+                or any(receipt.get(k) != v for k, v in expected.items())
+                or self.independent_failures and receipt.get('failure_isolation_hash') != self.failure_isolation_hash
+                or any(receipt.get(k) is not True for k in ('process_tree_empty', 'provider_completion_known', 'no_retry'))):
+            raise ContractError('TASK_FAILURE_BINDING')
+        with self.transaction() as db:
+            blocked = self.work_blocked(db)
+            if self.independent_failures and blocked:
+                return False
+            if not self._current(db, claim, {'VALIDATING'}, time.time()):
+                return False
+            key = claim['task']['task_id']
+            db.execute("UPDATE tasks SET state='FAILED',receipt=?,expires=NULL,provider_unknown=0 WHERE id=?",
+                       (canonical(receipt), key))
+            db.execute('DELETE FROM locks WHERE task=?', (key,))
+            db.execute('INSERT INTO isolated_task_failures VALUES(?,?,?,?)',
+                       (key, claim['attempt_id'], claim['epoch'], fingerprint(receipt)))
+            self._event(db, key, 'isolated_task_failure', attempt_id=claim['attempt_id'], epoch=claim['epoch'],
+                        receipt_hash=fingerprint(receipt), failure_scope='TASK',
+                        failure_isolation_hash=self.failure_isolation_hash,
+                        no_refill=not self.independent_failures, no_retry=True)
+            return True
+
+    def failures_are_isolated(self, *, db=None):
+        """Unmarked historical failures and any HELD/CANCELLED remain global stops."""
+        if db is None:
+            with self.transaction() as connection:
+                return self.failures_are_isolated(db=connection)
+        failures = db.execute("SELECT * FROM tasks WHERE state IN ('FAILED','CANCELLED','HELD')").fetchall()
+        if not failures:
+            return False
+        if self.independent_failures and len(failures) != db.execute('SELECT count(*) FROM isolated_task_failures').fetchone()[0]:
+            return False
+        for row in failures:
+            marker = db.execute('SELECT * FROM isolated_task_failures WHERE task=?', (row['id'],)).fetchone()
+            receipt = json.loads(row['receipt']) if row['receipt'] else {}
+            if (not marker or row['state'] != 'FAILED' or row['provider_unknown']
+                    or marker['attempt'] != row['attempt_id'] or marker['epoch'] != row['epoch']
+                    or marker['receipt_hash'] != fingerprint(receipt)
+                    or self.independent_failures and receipt.get('failure_isolation_hash') != self.failure_isolation_hash):
+                return False
+            if self.independent_failures and (receipt.get('category') not in {
+                    'VALIDATOR_ASSERTION', 'WORKER_ACCEPTANCE_FAILURE', 'REVIEW_REJECTED'}
+                    or any(receipt.get(k) != v for k, v in {
+                        'queue_id': self.queue_id, 'task_id': row['id'], 'task_hash': row['hash'],
+                        'attempt_id': row['attempt_id'], 'epoch': row['epoch'],
+                        'policy_hash': self.policy['policy_hash'], 'failure_scope': 'TASK'}.items())
+                    or any(receipt.get(k) is not True for k in ('no_retry', 'provider_completion_known', 'process_tree_empty'))):
+                return False
+        return True
+
+    def claim(self, lease_seconds=180, now=None, *, capabilities=None, halt_on_failure=False):
+        self._fresh()
+        if type(halt_on_failure) is not bool:
+            raise ContractError('HALT_ON_FAILURE_TYPE')
+        if type(lease_seconds) not in (int, float) or not 0 < lease_seconds <= 600:
+            raise ContractError('LEASE_BOUND')
+        now = time.time() if now is None else now
+        with self.transaction() as db:
+            decision = {'policy_hash': self.policy['policy_hash'], 'selected': None, 'candidates': []}
+            def audit(reason):
+                decision['reason'] = reason
+                sha = fingerprint(decision)
+                previous = db.execute('SELECT hash FROM scheduler_decision WHERE id=1').fetchone()
+                if not previous or previous[0] != sha:
+                    db.execute('INSERT OR REPLACE INTO scheduler_decision VALUES(1,?)', (sha,))
+                    self._event(db, decision['selected'] or '__scheduler__', 'dispatch_decision', **decision)
+            if db.execute('SELECT 1 FROM integration_failures LIMIT 1').fetchone():
+                audit('INTEGRATION_FAILURE_STOP')
+                return None
+            if db.execute('SELECT 1 FROM isolated_task_failures LIMIT 1').fetchone() and not self.independent_failures:
+                audit('ISOLATED_TASK_FAILURE_NO_REFILL')
+                return None
+            if self.independent_failures and self.work_blocked(db):
+                audit('GLOBAL_FAILURE_STOP')
+                return None
+            if (halt_on_failure and db.execute("SELECT 1 FROM tasks WHERE state IN ('HELD','FAILED','CANCELLED') LIMIT 1").fetchone()
+                    and not (self.independent_failures and self.failures_are_isolated(db=db))):
+                audit('FAILURE_STOP')
+                return None
+            self._ready(db)
+            cap = db.execute('SELECT active_cap FROM controller_binding').fetchone()[0]
+            active = db.execute("SELECT count(*) FROM tasks WHERE state IN ('CLAIMED','RUNNING','VALIDATING','HELD')").fetchone()[0]
+            active += db.execute('SELECT count(*) FROM development_native_slots').fetchone()[0]
+            budget = db.execute('SELECT * FROM budget').fetchone()
+            decision.update(active=active, active_cap=cap, dispatches_used=budget['used'],
+                            dispatches_limit=budget['max_dispatches'])
+            if active >= cap or budget['used'] >= budget['max_dispatches']:
+                audit('ACTIVE_CAP' if active >= cap else 'DISPATCH_BUDGET')
+                return None
+            limits = self.policy['settings']['scheduler'].get('resource_limits', {})
+            usage = {name: 0 for name in limits}
+            # HELD remains charged until positive process-tree cleanup evidence.
+            busy = db.execute("SELECT contract FROM tasks WHERE state IN ('CLAIMED','RUNNING','VALIDATING','HELD')").fetchall()
+            busy += db.execute('SELECT t.contract FROM tasks t JOIN development_native_slots s ON t.id=s.task').fetchall()
+            caps = self.policy['settings']['capabilities']
+            for record in busy:
+                costs = caps[json.loads(record['contract'])['capability']].get('resources', {})
+                for name, units in costs.items():
+                    usage[name] += units
+            decision.update(resource_usage=usage, resource_limits=limits)
+            locks = {r[0] for r in db.execute('SELECT resource FROM locks')}
+            rows = db.execute("SELECT * FROM tasks WHERE state='READY' ORDER BY rowid").fetchall()
+            # Stable sorting preserves insertion order for equal/default priorities.
+            rows.sort(key=lambda row: -json.loads(row['contract']).get('priority', 0))
+            for row in rows:
+                task = json.loads(row['contract'])
+                candidate = {'task_id': row['id'], 'priority': task.get('priority', 0), 'reason': 'ELIGIBLE'}
+                decision['candidates'].append(candidate)
+                if capabilities is not None and task['capability'] not in capabilities:
+                    candidate['reason'] = 'CAPABILITY'
+                    continue
+                if row['attempts'] >= task['budgets']['attempts'] or row['provider_unknown']:
+                    candidate['reason'] = 'ATTEMPT_BUDGET_OR_PROVIDER_UNKNOWN'
+                    continue
+                resources = sorted(set(task['resource_locks'] + ['file:' + p.casefold() for p in task['allowed_files']]))
+                if any(r in locks or (r.startswith('file:') and any(
+                       held.startswith('file:') and (r.startswith(held + '/') or held.startswith(r + '/'))
+                       for held in locks)) for r in resources):
+                    candidate['reason'] = 'OWNERSHIP_OR_RESOURCE_LOCK'
+                    continue
+                costs = caps[task['capability']].get('resources', {})
+                if any(usage[name] + units > limits[name] for name, units in costs.items()):
+                    candidate['reason'] = 'RESOURCE_QUOTA'
+                    continue
+                decision['selected'] = row['id']
+                audit('SELECTED')
+                token, epoch = uuid.uuid4().hex, row['epoch'] + 1
+                db.execute("UPDATE tasks SET state='CLAIMED',epoch=?,attempts=attempts+1,attempt_id=?,expires=? WHERE id=?",
+                           (epoch, token, now + lease_seconds, row['id']))
+                db.executemany('INSERT INTO locks VALUES(?,?)', [(r, row['id']) for r in resources])
+                db.execute('UPDATE budget SET used=used+1 WHERE id=1')
+                self._event(db, row['id'], 'CLAIMED', epoch=epoch, attempt_id=token)
+                return {'task': task, 'task_hash': row['hash'], 'attempt_id': token, 'epoch': epoch}
+            audit('NO_ELIGIBLE_TASK')
+        return None
+
+    def _transition(self, claim, before, after, now=None):
+        self._fresh()
+        now = time.time() if now is None else now
+        with self.transaction() as db:
+            if not self._current(db, claim, before, now):
+                return False
+            key = claim['task']['task_id']
+            db.execute('UPDATE tasks SET state=? WHERE id=?', (after, key))
+            self._event(db, key, after, epoch=claim['epoch'], attempt_id=claim['attempt_id'])
+            return True
+
+    def start(self, claim, now=None):
+        return self._transition(claim, {'CLAIMED'}, 'RUNNING', now)
+
+    def validating(self, claim, now=None):
+        return self._transition(claim, {'RUNNING'}, 'VALIDATING', now)
+
+    def heartbeat(self, claim, lease_seconds=180, now=None, *, timeout=10):
+        self._fresh()
+        if type(lease_seconds) not in (int, float) or not 0 < lease_seconds <= 600:
+            raise ContractError('LEASE_BOUND')
+        now = time.time() if now is None else now
+        with self.transaction(timeout=timeout) as db:
+            if not self._current(db, claim, {'CLAIMED', 'RUNNING', 'VALIDATING'}, now):
+                return False
+            key = claim['task']['task_id']
+            db.execute('UPDATE tasks SET expires=? WHERE id=?', (now + lease_seconds, key))
+            self._event(db, key, 'heartbeat', epoch=claim['epoch'], expires=now + lease_seconds)
+            return True
+
+    def finish(self, claim, receipt, passed, now=None):
+        self._fresh()
+        now = time.time() if now is None else now
+        if type(receipt) is not dict or receipt.get('process_tree_empty') is not True:
+            raise ContractError('CLEANUP_EVIDENCE_REQUIRED')
+        if type(passed) is not bool:
+            raise ContractError('VALIDATION_RESULT')
+        with self.transaction() as db:
+            if not self._current(db, claim, {'VALIDATING'}, now):
+                return False
+            key, state = claim['task']['task_id'], 'REVIEW' if passed else 'FAILED'
+            if passed and receipt.get('artifact_manifest_hash'):
+                row = db.execute('SELECT * FROM tasks WHERE id=?', (key,)).fetchone()
+                manifest, sha = self.artifacts.verified(db, row)
+                self.artifacts.bind_receipt(manifest, sha, receipt)
+            db.execute('UPDATE tasks SET state=?,receipt=?,expires=NULL WHERE id=?', (state, canonical(receipt), key))
+            db.execute('DELETE FROM locks WHERE task=?', (key,))
+            self._event(db, key, state, receipt_hash=fingerprint(receipt), epoch=claim['epoch'])
+            if passed:
+                db.execute('INSERT INTO merge_queue VALUES(?,?,?,?)',
+                           (key, fingerprint(receipt), 'HELD', 'TRUSTED_REVIEW_IMPORT_NOT_IMPLEMENTED'))
+            return True
+
+    def fence(self, claim, reason='cancelled', *, timeout=10):
+        with self.transaction(timeout=timeout) as db:
+            key = claim['task']['task_id']
+            row = db.execute('SELECT * FROM tasks WHERE id=?', (key,)).fetchone()
+            if not self._identity(row, claim) or row['state'] not in {'CLAIMED', 'RUNNING', 'VALIDATING'}:
+                return False
+            db.execute("UPDATE tasks SET state='HELD',epoch=epoch+1,reason=? WHERE id=?", (reason, key))
+            self._event(db, key, 'fenced', reason=reason, epoch=claim['epoch'] + 1)
+            return True
+
+    def expired(self, now=None):
+        now = time.time() if now is None else now
+        with self.transaction() as db:
+            claims = [{'task': json.loads(r['contract']), 'task_hash': r['hash'], 'attempt_id': r['attempt_id'], 'epoch': r['epoch']}
+                      for r in db.execute("SELECT * FROM tasks WHERE state IN ('CLAIMED','RUNNING','VALIDATING') AND expires<=?", (now,))]
+            for claim in claims:
+                key = claim['task']['task_id']
+                db.execute("UPDATE tasks SET state='HELD',epoch=epoch+1,reason='lease_expired' WHERE id=?", (key,))
+                self._event(db, key, 'lease_expired', epoch=claim['epoch'] + 1)
+            return claims
+
+    def cleanup(self, claim, *, tree_empty, retry=False, provider_completion_unknown=False):
+        self._fresh()
+        with self.transaction() as db:
+            key = claim['task']['task_id']
+            row = db.execute('SELECT * FROM tasks WHERE id=?', (key,)).fetchone()
+            if not self._identity(row, claim, 1) or row['state'] != 'HELD' or tree_empty is not True:
+                return False
+            if provider_completion_unknown:
+                db.execute('UPDATE tasks SET provider_unknown=1 WHERE id=?', (key,))
+            if retry and (provider_completion_unknown or row['provider_unknown'] or row['attempts'] >= claim['task']['budgets']['attempts']):
+                return False
+            state = 'PENDING' if retry else 'CANCELLED'
+            db.execute('UPDATE tasks SET state=?,expires=NULL WHERE id=?', (state, key))
+            db.execute('DELETE FROM locks WHERE task=?', (key,))
+            self._event(db, key, 'cleanup', tree_empty=True, retry=retry, state=state)
+            self._ready(db)
+            return True
+
+    def dispatch_intent(self, claim):
+        self._fresh()
+        with self.transaction() as db:
+            if ((self.independent_failures and self.work_blocked(db, claim['task']['task_id']))
+                    or not self.independent_failures and db.execute('SELECT 1 FROM isolated_task_failures LIMIT 1').fetchone()):
+                return False
+            row = db.execute('SELECT * FROM tasks WHERE id=?', (claim['task']['task_id'],)).fetchone()
+            if not self._current(db, claim, {'RUNNING'}, time.time()) or row['provider_unknown']:
+                return False
+            key = claim['task']['task_id']
+            db.execute('UPDATE tasks SET provider_unknown=1 WHERE id=?', (key,))
+            self._event(db, key, 'dispatch_intent', epoch=claim['epoch'], provider_completion='UNKNOWN')
+            return True
+
+    def merge_snapshot(self):
+        with self.transaction() as db:
+            return [dict(r) for r in db.execute('SELECT * FROM merge_queue ORDER BY rowid')]
+
+    def review_challenge(self, task_id, ttl=300):
+        self._fresh()
+        if type(ttl) is not int or not 1 <= ttl <= 600:
+            raise ContractError('REVIEW_TTL')
+        with self.transaction() as db:
+            row = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
+            if not row or row['state'] != 'REVIEW':
+                raise ContractError('REVIEW_STATE')
+            manifest, artifact_hash = self.artifacts.verified(db, row)
+            self.artifacts.bind_receipt(manifest, artifact_hash, json.loads(row['receipt']))
+            target = {'queue_id': self.queue_id, 'task_id': task_id, 'task_hash': row['hash'],
+                      'attempt_id': row['attempt_id'], 'epoch': row['epoch'], 'policy_hash': self.policy['policy_hash'],
+                      'receipt_hash': fingerprint(json.loads(row['receipt'])), 'artifact_hash': artifact_hash,
+                      'nonce': uuid.uuid4().hex, 'expires': time.time() + ttl,
+                      'worker_actor': manifest['worker_actor'], 'mode': self.evidence_mode,
+                      'purpose': 'codex-orchestrator/task-review/v1', 'registry_hash': self.trust.sha256 if self.trust else None}
+            db.execute('INSERT INTO review_challenges(nonce,task,target) VALUES(?,?,?)', (target['nonce'], task_id, canonical(target)))
+            return target
+
+    def import_review(self, envelope):
+        try:
+            return self._import_review(envelope)
+        except ContractError as error:
+            if self.evidence_mode == 'production':
+                self._review_rejection(envelope, str(error))
+            raise
+
+    def _review_rejection(self, envelope, reason):
+        """Audit a rejection without trusting or persisting caller content."""
+        from .evidence import frozen_bytes
+        target = None
+        try:
+            data = canonical(envelope).encode()
+            envelope_hash = fingerprint(envelope) if len(data) <= 65536 else None
+            if type(envelope) is dict and type(envelope.get('payload')) is dict:
+                target = envelope['payload'].get('target')
+        except (TypeError, ValueError):
+            envelope_hash = None
+        evidence_id = uuid.uuid4().hex
+        receipt = {'evidence_id': evidence_id, 'queue_id': self.queue_id,
+                   'policy_hash': self.policy['policy_hash'], 'envelope_hash': envelope_hash,
+                   'admission': 'BLOCKED', 'reason': reason, 'mode': 'production'}
+        frozen_bytes(self.path.parent / 'review-admission' / (evidence_id + '.json'), canonical(receipt).encode())
+        with self.transaction() as db:
+            key = None
+            if type(target) is dict and isinstance(target.get('nonce'), str):
+                challenge = db.execute('SELECT task,target FROM review_challenges WHERE nonce=?', (target['nonce'],)).fetchone()
+                if challenge and challenge['target'] == canonical(target):
+                    key = challenge['task']
+            self._event(db, key, 'review_admission_rejected', evidence_id=evidence_id,
+                        receipt_hash=fingerprint(receipt), reason=reason)
+
+    def _import_review(self, envelope):
+        self._fresh()
+        if self.evidence_mode == 'DEVELOPMENT':
+            raise ContractError('DEVELOPMENT_REVIEW_REQUIRES_CONTROLLER_EXECUTION')
+        if self.trust is None:
+            raise ContractError('TRUST_REGISTRY_REQUIRED')
+        kind, key_hash = self.trust.verify(envelope)
+        payload = envelope['payload']
+        if set(payload) != {'target', 'reviewer_id', 'decision', 'observed_model', 'observed_effort', 'execution_evidence_hash'}:
+            raise ContractError('REVIEW_SCHEMA')
+        target = payload['target']
+        if type(target) is not dict or payload['decision'] not in {'PASS', 'REJECT'}:
+            raise ContractError('REVIEW_SCHEMA')
+        if self.evidence_mode == 'production' and kind != 'native_attester':
+            raise ContractError('REQUIRED_MODEL_REVIEW_HELD')
+        if self.evidence_mode == 'OFFLINE_TEST' and kind != 'offline_fixture':
+            raise ContractError('REVIEW_REALM_MISMATCH')
+        rank = {'high': 0, 'xhigh': 1, 'max': 2, 'ultra': 3}
+        required = self.policy['settings']['roles']['reviewer']
+        if (payload['observed_model'] != required['model']
+                or rank.get(payload['observed_effort'], -1) < rank[required['reasoning_effort']]):
+            raise ContractError('REVIEW_MODEL_FLOOR')
+        import re
+        if not isinstance(payload['execution_evidence_hash'], str) or not re.fullmatch('[a-f0-9]{64}', payload['execution_evidence_hash']):
+            raise ContractError('REVIEW_EXECUTION_EVIDENCE')
+        with self.transaction() as db:
+            challenge = db.execute('SELECT * FROM review_challenges WHERE nonce=?', (target.get('nonce'),)).fetchone()
+            row = db.execute('SELECT * FROM tasks WHERE id=?', (target.get('task_id'),)).fetchone()
+            if not challenge or challenge['used'] or challenge['target'] != canonical(target):
+                raise ContractError('REVIEW_REPLAY_OR_UNKNOWN')
+            if (not row or row['state'] != 'REVIEW' or target['expires'] <= time.time()
+                    or row['attempt_id'] != target['attempt_id'] or row['epoch'] != target['epoch']
+                    or row['hash'] != target['task_hash'] or self.queue_id != target['queue_id']
+                    or self.policy['policy_hash'] != target['policy_hash']
+                    or fingerprint(json.loads(row['receipt'])) != target['receipt_hash']):
+                raise ContractError('STALE_REVIEW')
+            manifest, artifact_hash = self.artifacts.verified(db, row)
+            self.artifacts.bind_receipt(manifest, artifact_hash, json.loads(row['receipt']))
+            if artifact_hash != target['artifact_hash'] or payload['reviewer_id'] == manifest['worker_actor']:
+                raise ContractError('REVIEW_NOT_INDEPENDENT')
+            receipt = json.loads(row['receipt'])
+            if self.evidence_mode == 'production':
+                # A signed model-name assertion is not observed native provenance.
+                # Until the native reviewer execution ledger is wired and proven,
+                # even a pinned attester cannot release the production floor.
+                runtime = db.execute('SELECT * FROM review_runtime WHERE nonce=?', (target['nonce'],)).fetchone()
+                if not runtime:
+                    reason = 'MISSING_EXECUTION_RECEIPT'
+                elif runtime['hash'] != payload['execution_evidence_hash']:
+                    reason = 'EXECUTION_RECEIPT_MISMATCH'
+                else:
+                    self._runtime_file(target['nonce'], runtime['hash'])
+                    reason = 'CONFIGURED_METADATA_IS_NOT_EXECUTION_PROVENANCE'
+                raise ContractError('REQUIRED_NATIVE_REVIEW_PROVENANCE_UNAVAILABLE:' + reason)
+            db.execute('UPDATE review_challenges SET used=1 WHERE nonce=?', (target['nonce'],))
+            db.execute('INSERT INTO reviews VALUES(?,?,?,?)', (row['id'], canonical(envelope), fingerprint(envelope), kind))
+            state = 'PASSED' if payload['decision'] == 'PASS' else 'FAILED'
+            db.execute('UPDATE tasks SET state=? WHERE id=?', (state, row['id']))
+            db.execute('UPDATE merge_queue SET reason=? WHERE task=?', ('HUMAN_MERGE_AUTHORIZATION_REQUIRED' if state == 'PASSED' else 'REVIEW_REJECTED', row['id']))
+            self._event(db, row['id'], state, review_hash=fingerprint(envelope), reviewer_key=key_hash, evidence_mode=self.evidence_mode)
+            self._ready(db)
+            return {'state': state, 'evidence_mode': self.evidence_mode, 'review_hash': fingerprint(envelope), 'merge_executed': False}
+
+    def record_review_runtime(self, target, started, completed):
+        """Durably bind diagnostic metadata; this does not enroll an attester.
+
+        Reuses the review challenge and artifact custody checks. Recording does
+        not consume a nonce, change task state, or grant production admission.
+        """
+        self._fresh()
+        if type(target) is not dict:
+            raise ContractError('REVIEW_RUNTIME_TARGET')
+        from .admission import app_server_review_metadata
+        from .evidence import frozen_bytes, digest
+        with self.transaction() as db:
+            challenge = db.execute('SELECT * FROM review_challenges WHERE nonce=?', (target.get('nonce'),)).fetchone()
+            row = db.execute('SELECT * FROM tasks WHERE id=?', (target.get('task_id'),)).fetchone()
+            if not challenge or challenge['used'] or challenge['target'] != canonical(target):
+                raise ContractError('REVIEW_REPLAY_OR_UNKNOWN')
+            if (not row or row['state'] != 'REVIEW' or target['expires'] <= time.time()
+                    or row['attempt_id'] != target['attempt_id'] or row['epoch'] != target['epoch']
+                    or row['hash'] != target['task_hash'] or self.queue_id != target['queue_id']
+                    or self.policy['policy_hash'] != target['policy_hash']
+                    or fingerprint(json.loads(row['receipt'])) != target['receipt_hash']):
+                raise ContractError('STALE_REVIEW')
+            manifest, artifact_hash = self.artifacts.verified(db, row)
+            self.artifacts.bind_receipt(manifest, artifact_hash, json.loads(row['receipt']))
+            if artifact_hash != target['artifact_hash']:
+                raise ContractError('REVIEW_ARTIFACT_MISMATCH')
+            receipt = app_server_review_metadata(target, started, completed)
+            sha = fingerprint(receipt)
+            previous = db.execute('SELECT * FROM review_runtime WHERE nonce=?', (target['nonce'],)).fetchone()
+            if previous:
+                if previous['hash'] != sha:
+                    raise ContractError('REVIEW_RUNTIME_REPLAY_OR_DRIFT')
+                self._runtime_file(target['nonce'], previous['hash'])
+                return json.loads(previous['receipt'])
+            path = self.path.parent / 'review-runtime' / (target['nonce'] + '.json')
+            data = canonical(receipt).encode()
+            if path.exists():
+                # A controller crash after exclusive write but before DB commit
+                # may leave an identical orphan. Never overwrite different bytes.
+                from .evidence import guarded
+                if digest(guarded(path).read_bytes()) != sha:
+                    raise ContractError('REVIEW_RUNTIME_FILE_DRIFT')
+            else:
+                frozen_bytes(path, data)
+            db.execute('INSERT INTO review_runtime VALUES(?,?,?)', (target['nonce'], sha, canonical(receipt)))
+            self._event(db, row['id'], 'review_runtime_blocked', receipt_hash=sha,
+                        nonce=target['nonce'], blockers=receipt['blockers'])
+            return receipt
+
+    def _runtime_file(self, nonce, sha):
+        from .evidence import guarded, digest
+        path = guarded(self.path.parent / 'review-runtime' / (nonce + '.json'))
+        if not path.is_file() or digest(path.read_bytes()) != sha:
+            raise ContractError('REVIEW_RUNTIME_FILE_DRIFT')
+
+    def merge(self, *args, **kwargs):
+        raise ContractError('MERGE_EXECUTION_DISABLED')
+
+
+def normalize_task(task):
+    """Named Phase 1–2 fields map losslessly onto the reused strict v2 contract."""
+    if type(task) is not dict or task.get('schema_version') != 3:
+        return task
+    result = dict(task)
+    try:
+        acceptance = result.pop('acceptance')
+        if type(acceptance) is not dict or set(acceptance) != {'criteria', 'validators'}:
+            raise ContractError('ACCEPTANCE_SCHEMA')
+        result['acceptance_criteria'] = acceptance['criteria']
+        result['tests'] = acceptance['validators']
+        result['execution'] = result.pop('model_policy')
+        result['budgets'] = result.pop('retry_budget')
+        result['schema_version'] = 2
+    except KeyError:
+        raise ContractError('CONTRACT_SCHEMA') from None
+    return result

@@ -36,6 +36,21 @@ class SafeFailure(Exception):
     """Only fixed, nonsensitive error codes may cross the tool boundary."""
 
 
+class ResourceResponseFailure(SafeFailure):
+    """Fixed validation category; never includes provider data or question IDs."""
+    CODES = frozenset({'RESPONSE_SHAPE', 'MODEL_ID', 'QUESTION_SET', 'ANSWER_SHAPE',
+        'ANSWER_TYPE', 'CHOICE_OPTION', 'PROBABILITY_KEYS', 'CONFIDENCE_VALUE',
+        'PROBABILITY_VALUE', 'PROBABILITY_SUM', 'CHOICE_ARGMAX'})
+
+    def __init__(self, code):
+        super().__init__('INVALID_RESOURCE_RESPONSE')
+        self.validation_code = code if code in self.CODES else 'RESPONSE_SHAPE'
+
+
+def _response_diagnostics(error):
+    return {'validation_code': error.validation_code} if isinstance(error, ResourceResponseFailure) else {}
+
+
 def read_json(path: Path) -> dict:
     if path.stat().st_size > MAX_BYTES:
         raise SafeFailure("CONFIG_TOO_LARGE")
@@ -309,22 +324,35 @@ def _resource_result(reason, selected=None, **extra):
 
 def validate_resource_answers(response, questions):
     try:
+        if type(response) is not dict or not {'model', 'answers'} <= response.keys():
+            raise ResourceResponseFailure('RESPONSE_SHAPE')
         model = response["model"]
         answers = response["answers"]
-        if (not isinstance(model, str) or not re.fullmatch(r"jev-[a-zA-Z0-9._-]{1,48}", model)
-                or type(answers) is not dict or set(answers) != set(questions)):
-            raise ValueError
+        if not isinstance(model, str) or not re.fullmatch(r"jev-[a-zA-Z0-9._-]{1,48}", model):
+            raise ResourceResponseFailure('MODEL_ID')
+        if type(answers) is not dict or set(answers) != set(questions):
+            raise ResourceResponseFailure('QUESTION_SET')
         clean = {}
         for kind, question in questions.items():
             answer = answers[kind]
+            if type(answer) is not dict or not {'type', 'choice', 'confidence', 'probabilities'} <= answer.keys():
+                raise ResourceResponseFailure('ANSWER_SHAPE')
             choice, confidence, probs = answer["choice"], answer["confidence"], answer["probabilities"]
             options = set(question["criteria"])
-            if (answer["type"] != "choice" or choice not in options or type(probs) is not dict
-                    or set(probs) != options or type(confidence) not in (int, float)
-                    or not 0 <= confidence <= 1 or not math.isfinite(confidence)
-                    or any(type(p) not in (int, float) or not 0 <= p <= 1 or not math.isfinite(p) for p in probs.values())
-                    or abs(sum(probs.values()) - 1) > .001 or probs[choice] != max(probs.values())):
-                raise ValueError
+            if answer['type'] != 'choice':
+                raise ResourceResponseFailure('ANSWER_TYPE')
+            if not isinstance(choice, str) or choice not in options:
+                raise ResourceResponseFailure('CHOICE_OPTION')
+            if type(probs) is not dict or set(probs) != options:
+                raise ResourceResponseFailure('PROBABILITY_KEYS')
+            if type(confidence) not in (int, float) or not 0 <= confidence <= 1 or not math.isfinite(confidence):
+                raise ResourceResponseFailure('CONFIDENCE_VALUE')
+            if any(type(p) not in (int, float) or not 0 <= p <= 1 or not math.isfinite(p) for p in probs.values()):
+                raise ResourceResponseFailure('PROBABILITY_VALUE')
+            if abs(sum(probs.values()) - 1) > .001:
+                raise ResourceResponseFailure('PROBABILITY_SUM')
+            if probs[choice] != max(probs.values()):
+                raise ResourceResponseFailure('CHOICE_ARGMAX')
             clean[kind] = {"choice": choice, "confidence": confidence, "probabilities": probs}
         usage = response.get("usage", {})
         if type(usage) is not dict or any(v is not None and (type(v) is not int or not 0 <= v <= (1 << 63)-1)
@@ -332,7 +360,7 @@ def validate_resource_answers(response, questions):
             usage = {}
         return model, clean, {key: usage.get(key) for key in ("input_tokens", "output_tokens")}
     except (KeyError, ValueError, TypeError, AttributeError):
-        raise SafeFailure("INVALID_RESOURCE_RESPONSE") from None
+        raise ResourceResponseFailure('RESPONSE_SHAPE') from None
 
 
 def select_resources(args: dict, global_path: Path, requester=None) -> dict:
@@ -397,7 +425,7 @@ def select_resources(args: dict, global_path: Path, requester=None) -> dict:
     except SafeFailure as error:
         return _resource_result(str(error), selected, status="fallback", provider_attempted=attempted,
                                 provider_called=False if not attempted or str(error) == "AUTH_MISSING" else None,
-                                provider_result="UNVERIFIED")
+                                provider_result="UNVERIFIED", **_response_diagnostics(error))
     except (OSError, ValueError, TypeError):
         return _resource_result("LOCAL_OR_PROVIDER_FAILURE", selected, status="fallback", provider_result="UNVERIFIED")
 
@@ -549,7 +577,7 @@ def _decide(args, global_path, requester=None):
     except SafeFailure as error:
         return _resource_result(str(error), selected, status='fallback', route='coordinate',
                                 provider_attempted=attempted, provider_called=False if not attempted or str(error) == 'AUTH_MISSING' else None,
-                                provider_result='UNVERIFIED', required_review=False)
+                                provider_result='UNVERIFIED', required_review=False, **_response_diagnostics(error))
     except (OSError, ValueError, TypeError):
         return _resource_result('LOCAL_OR_PROVIDER_FAILURE', selected, status='fallback', route='coordinate', provider_result='UNVERIFIED', required_review=False)
 

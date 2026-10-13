@@ -6,16 +6,18 @@
 
 ```powershell
 $env:PYTHONDONTWRITEBYTECODE = '1'
-python -B -m unittest test_decision test_phase2a test_resources test_combined test_inventory_safety
+python -B -m unittest test_response_diagnostics test_decision test_phase2a test_resources test_combined test_inventory_safety
 ```
 
-預期 73 個測試。再於 `payload/jev` 執行：
+預期 77 個測試，包含 4 個固定失敗分類碼回歸測試。再於 `payload/jev` 執行：
 
 ```powershell
 $env:PYTHONDONTWRITEBYTECODE = '1'
 python -B -m unittest test_inventory
 ```
 
-預期 12 個測試，共 85 個。`PYTHONDONTWRITEBYTECODE` 同時傳給測試啟動的 Python 子程序，避免生成 pyc。
+預期 12 個測試，共 89 個。`PYTHONDONTWRITEBYTECODE` 同時傳給測試啟動的 Python 子程序，避免生成 pyc。
 
-本次匯出驗證使用 `C:\Program Files\Python312\python.exe`：73/73 與 12/12 均通過。此結果只證明離線程式與測試的行為，不代表 Codex CLI、App 連線、付費推論、全域安裝或效能比較已通過。測試會建立並清理自己的暫存 fixtures；不應將暫存資料、cache 或 runtime journal 提交。
+本次候選驗證使用 `C:\Program Files\Python312\python.exe`：77/77 與 12/12 均通過。此結果只證明離線程式與測試的行為，不代表 Codex CLI、App 連線、付費推論、全域安裝或效能比較已通過。測試會建立並清理自己的暫存 fixtures；不應將暫存資料、cache 或 runtime journal 提交。
+
+分類碼測試包含 13 種不合法回覆、兩條資源選擇路徑的欄位傳遞、必要資源保留、無原始內容回傳及 journal schema 不變；合成 provider 不構成歷史失敗根因證據。

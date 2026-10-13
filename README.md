@@ -49,3 +49,12 @@ The prior native App integration exposed all six tools and successfully called s
 - [Combined context and observation contract](docs/codex-jev-context.md)
 
 Global maintenance remains a separate operation: audit exact targets, stage verified backups and hashes, obtain applicable independent review, apply only the bounded diff, then verify the actual CLI/App and preserve concurrent changes. This repository does not provide the earlier machine-specific transactional installer.
+
+## Phase 1–2 orchestrator candidate
+
+隔離增量候選、操作命令與驗收缺口見 [Phase 1–2 ADR / delivery](docs/orchestrator-phase1-2.md)。
+標準庫 Queue、Scheduler 與 Worktree 已接通。明確授權的 Development Mode
+使用官方 Codex CLI 原生 Sandbox、pinned native validators 與獨立 CLI reviewer；
+高保證 Production Admission 的程式與歷史 FAIL 保留，但該路線目前停止且 BLOCKED。
+日常執行不依賴它，也沒有提供已驗收的高保證 backend 切換。實際驗收結果見 ADR，
+離線測試數字不代表真實 Worker 已通過。所有 merge 仍需人工授權。
