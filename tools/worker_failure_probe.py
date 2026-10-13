@@ -51,6 +51,12 @@ def emit(case, workspace):
     if case == 'ordinary':
         frozen_bytes(workspace / 'artifact/result.json', b'{"answer":42}\n')
         event({'type': 'item.completed', 'item': {'id': 'corrected', 'type': 'file_change', 'status': 'completed'}})
+        # Current policy requires recovery evidence for the failed command;
+        # a file edit alone must not resolve an outstanding tool failure.
+        event({'type': 'item.completed', 'item': {'id': 'recovered-command',
+            'type': 'command_execution', 'status': 'completed',
+            'command': 'python missing-fixture', 'exit_code': 0,
+            'aggregated_output': 'Synthetic same-turn recovery'}})
         event({'type': 'turn.completed', 'usage': {}})
         return 0
     time.sleep(3)
